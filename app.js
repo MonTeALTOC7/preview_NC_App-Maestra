@@ -1,0 +1,1245 @@
+/* ============================================================
+   app.js — Orquestador del shell "Negocios de Caña CASUR".
+   Renderiza las vistas y coordina router, registro, gate,
+   estado y Service Worker. Carga cada módulo en un <iframe>
+   aislado (no ejecuta su Service Worker; solo el SW raíz).
+   ============================================================ */
+
+import * as router from './core/navigation/router.js';
+import { createModuleCheckpointRunner, resolveHistoryNavigation } from './core/navigation/module-checkpoint.js';
+import { installUpdateControl } from './core/updates/pwa-update.js';
+import { protectModuleActivity } from './core/updates/activity-guard.js';
+import {contextStore} from './core/updates/context-store.js';
+import * as registry from './core/module-registry/registry.js';
+import * as gate from './core/permissions/gate.js';
+import * as status from './core/sync/status.js';
+import { APP_VERSION, APP_CHANNEL, moduleVersion, moduleStatus } from './core/versions/versions.js';
+import { icon } from './shared/components/icons.js';
+import * as masterStore from './core/shared-data/master-store.js';
+import { adaptSiagriToProduction } from './master/adapters/production-data-adapter.js';
+import { buildMaestroCentralFromReportRows, compareMaestroVersions } from './master/adapters/master-to-riego-adapter.js';
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; };
+
+const app = $('#app');
+const viewEl = $('#view');
+const navEl = $('#nav');
+const MODULE_CHECKPOINT_ERROR = 'No se pudo proteger el trabajo pendiente. El cambio de módulo fue cancelado.';
+const MODULE_CONTEXT_ERROR = 'No se pudo abrir la suerte solicitada.';
+const MODULE_CONTEXT_TIMEOUT_MS = 2000;
+let moduleNavigationPending = false;
+let approvedModuleRoute = '';
+let currentRenderedRoute = '';
+let pendingHistoryRoute = null;
+let historyNavigationPending = false;
+let pendingModuleContext = null;
+
+function activeModuleBridge() {
+  const frame = $('#mFrame');
+  try { return frame?.contentWindow?.CASUR_MODULE_BRIDGE; }
+  catch { return null; }
+}
+
+const runActiveModuleCheckpoint = createModuleCheckpointRunner(activeModuleBridge);
+
+function normalizeLotContext(context) {
+  if (!context || context.kind !== 'lot') return null;
+  const lotId = String(context.lotId || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(lotId)) return null;
+  return {
+    kind: 'lot',
+    lotId,
+    farmCode: String(context.farmCode || ''),
+    lot: String(context.lot || ''),
+    producer: String(context.producer || ''),
+  };
+}
+
+function getActiveLotContext(moduleId) {
+  if (moduleId !== 'tch') return null;
+  try {
+    const bridge = activeModuleBridge();
+    if (bridge?.protocolVersion !== 1 || bridge.moduleId !== 'tch' || typeof bridge.getActiveContext !== 'function') return null;
+    const context = bridge.getActiveContext();
+    if (context && typeof context.then === 'function') return null;
+    return normalizeLotContext(context);
+  } catch {
+    return null;
+  }
+}
+
+function withModuleContextTimeout(promise) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, status: 'timeout' }), MODULE_CONTEXT_TIMEOUT_MS); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function consumePendingModuleContext(frame, moduleId) {
+  const pending = pendingModuleContext;
+  if (!pending) return;
+  pendingModuleContext = null;
+  if (pending.targetModuleId !== moduleId) return;
+  try {
+    const bridge = frame?.contentWindow?.CASUR_MODULE_BRIDGE;
+    frame?.contentWindow?.CASUR_CANCEL_UPDATE_CONTEXT?.();
+    if (bridge?.protocolVersion !== 1 || bridge.moduleId !== moduleId || typeof bridge.openContext !== 'function') {
+      toast(MODULE_CONTEXT_ERROR);
+      return;
+    }
+    const result = await withModuleContextTimeout(bridge.openContext(pending.context));
+    if (!result?.ok) toast(MODULE_CONTEXT_ERROR);
+  } catch {
+    toast(MODULE_CONTEXT_ERROR);
+  }
+}
+
+async function checkpointActiveModule(reason, update = {}) {
+  const frame = $('#mFrame');
+  if (!frame) return { ok: true, status: 'no-frame' };
+  try {
+    const guard=protectModuleActivity(frame.contentWindow);
+    const result=await guard.checkpoint({protocolVersion:1, moduleId:activeModuleBridge()?.moduleId,
+      checkpoint:()=>runActiveModuleCheckpoint(reason)},reason);
+    if(result.ok && reason!=='pwa-update')frame.contentWindow.CASUR_CANCEL_UPDATE_CONTEXT?.();
+    if(result.ok && reason==='pwa-update' && frame.contentWindow.CASUR_SAVE_UPDATE_CONTEXT &&
+       frame.contentWindow.CASUR_SAVE_UPDATE_CONTEXT({reason,targetVersion:update.targetVersion})===false)return {ok:false,status:'context-not-ready'};
+    return result;
+  } catch { return {ok:false,status:'unavailable'}; }
+}
+
+async function navigateFromActiveModule(path, reason, moduleContext = null) {
+  if (moduleNavigationPending) return false;
+  moduleNavigationPending = true;
+  try {
+    const result = await checkpointActiveModule(reason);
+    if (!result.ok) {
+      toast(MODULE_CHECKPOINT_ERROR);
+      return false;
+    }
+    pendingModuleContext = moduleContext;
+    approvedModuleRoute = path;
+    router.go(path);
+    return true;
+  } finally {
+    moduleNavigationPending = false;
+  }
+}
+
+async function reloadActiveModule(reason = 'reload') {
+  if (moduleNavigationPending) return false;
+  moduleNavigationPending = true;
+  try {
+    const result = await checkpointActiveModule(reason);
+    if (!result.ok) {
+      toast(MODULE_CHECKPOINT_ERROR);
+      return false;
+    }
+    const frame = $('#mFrame');
+    if (frame) frame.src = frame.src;
+    return Boolean(frame);
+  } finally {
+    moduleNavigationPending = false;
+  }
+}
+
+/* Mini-logos (isotipos) por módulo para las tarjetas del home.
+   Familia gráfica coherente del ecosistema "Negocios de Caña".
+   Los 5 primeros son SVG propios; Inventario reutiliza el emblema
+   oficial de Pansaco reenmarcado a la familia. */
+const MODULE_LOGOS = {
+  produccion: 'shared/assets/logos/produccion.svg',
+  tch:        'shared/assets/logos/tch.svg',
+  riego:      'shared/assets/logos/riego.svg',
+  insumos:    'shared/assets/logos/insumos.svg',
+  inventario: 'shared/assets/logos/inventario.png',
+  labores:    'shared/assets/logos/labores.svg',
+};
+function logoFor(id) { return MODULE_LOGOS[id] || 'shared/assets/icons/emblem-192.png'; }
+
+/* ---------------- Header ---------------- */
+function renderHeader() {
+  $('#appVersion').textContent = 'v' + APP_VERSION;
+  updateConn(status.isOnline());
+}
+function updateConn(online) {
+  const c = $('#conn');
+  c.classList.toggle('is-offline', !online);
+  c.querySelector('.conn__label').textContent = online ? 'En línea' : 'Sin conexión';
+  c.querySelector('.conn__ic').innerHTML = icon(online ? 'wifi' : 'wifiOff');
+  const railStatus = $('#railStatus');
+  if (railStatus) {
+    railStatus.classList.toggle('is-offline', !online);
+    railStatus.querySelector('[data-conn-label]').textContent = online ? 'En línea' : 'Sin conexión';
+  }
+}
+status.onConnectivityChange(updateConn);
+
+/* ---------------- Barra lateral (escritorio) ----------------
+   Navegación principal en pantallas anchas: Inicio, todos los módulos
+   visibles agrupados por superficie de uso y Centro Maestro. Si hay un
+   módulo abierto, el cambio pasa por el mismo checkpoint que el selector
+   (nunca se pierde trabajo pendiente). El área privada no aparece aquí. */
+const RAIL_KEY = 'casur_master_rail_collapsed';
+const railEl = $('#rail');
+
+function shellNavigate(path) {
+  if (routePath(router.current()) === path && currentRenderedRoute === path) return;
+  if ($('#mFrame')) { void navigateFromActiveModule(path, path === '/' ? 'back-home' : 'module-switch'); return; }
+  router.go(path);
+}
+
+function renderRail(r) {
+  if (!railEl) return;
+  const activePath = r ? routePath(r) : '/';
+  const item = (path, label, iconKey) => `<button class="rail__item ${activePath === path ? 'is-active' : ''}" type="button"
+      data-rail-path="${path}" title="${label}" ${activePath === path ? 'aria-current="page"' : ''}>${icon(iconKey)}<span>${label}</span></button>`;
+  const groups = registry.homeGroups().map((g) => `<div class="rail__group">
+      <p class="rail__label">${g.title}</p>
+      ${g.modules.map((m) => item('/modulo/' + m.moduleId, m.name, m.icon)).join('')}
+    </div>`).join('');
+  const online = status.isOnline();
+  railEl.innerHTML = `
+    <div class="rail__brand">
+      <img src="shared/assets/icons/emblem-192.png" alt="" width="32" height="32">
+      <span class="rail__brand-text"><strong>Negocios de Caña</strong><small>CASUR · v${APP_VERSION}</small></span>
+    </div>
+    <nav class="rail__scroll" aria-label="Módulos">
+      <div class="rail__group">${item('/', 'Inicio', 'home')}</div>
+      ${groups}
+    </nav>
+    <div class="rail__foot">
+      ${item('/centro-maestro', 'Centro Maestro', 'master')}
+      <div class="rail__status ${online ? '' : 'is-offline'}" id="railStatus" role="status">
+        <span class="conn__dot"></span><span data-conn-label>${online ? 'En línea' : 'Sin conexión'}</span>
+      </div>
+      <button class="rail__item rail__toggle" type="button" id="railToggle" title="Contraer o expandir el menú"
+        aria-pressed="${document.body.classList.contains('rail-collapsed')}">${icon('collapse')}<span>Contraer menú</span></button>
+    </div>`;
+}
+
+if (railEl) {
+  if (lsGet(RAIL_KEY) === '1') document.body.classList.add('rail-collapsed');
+  railEl.addEventListener('click', (event) => {
+    if (event.target.closest('#railToggle')) {
+      const collapsed = document.body.classList.toggle('rail-collapsed');
+      try { localStorage.setItem(RAIL_KEY, collapsed ? '1' : '0'); } catch { /* modo privado */ }
+      $('#railToggle')?.setAttribute('aria-pressed', String(collapsed));
+      return;
+    }
+    const target = event.target.closest('[data-rail-path]');
+    if (target) shellNavigate(target.dataset.railPath);
+  });
+}
+
+/* ---------------- Bottom nav ---------------- */
+function renderNav(active) {
+  // El acceso al área privada NO aparece en la navegación normal:
+  // se entra desde Centro Maestro, para que otros usuarios ni lo vean.
+  const items = [
+    { key: 'home', label: 'Inicio', icon: 'home', path: '/' },
+    { key: 'centro-maestro', label: 'Centro Maestro', icon: 'master', path: '/centro-maestro' },
+  ];
+  navEl.innerHTML = '';
+  items.forEach((it) => {
+    const b = el(`<button class="nav__item ${active === it.key ? 'is-active' : ''}" type="button">
+        ${icon(it.icon)}<span>${it.label}</span></button>`);
+    b.addEventListener('click', () => router.go(it.path));
+    navEl.appendChild(b);
+  });
+}
+
+/* ============================================================
+   Instalación centralizada de la PWA maestra "Negocios de Caña".
+   Toda la lógica de instalación vive en el shell (nunca en los
+   módulos/iframes). Captura beforeinstallprompt/appinstalled y
+   muestra un banner elegante en el Home con reglas de visibilidad
+   y persistencia local con namespace del shell.
+   ============================================================ */
+const INSTALL_KEYS = {
+  installed: 'casur_master_installed',
+  dismissed: 'casur_master_install_dismissed',
+};
+const INSTALL_DISMISS_MS = 7 * 24 * 60 * 60 * 1000; /* respetar cierre 7 días */
+let deferredInstallPrompt = null;
+
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+function isAppInstalled() {
+  if (lsGet(INSTALL_KEYS.installed) === '1') return true;
+  if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) return true;
+  if (window.navigator.standalone === true) return true; /* iOS Safari */
+  return false;
+}
+function installDismissedRecently() {
+  const t = Number(lsGet(INSTALL_KEYS.dismissed) || 0);
+  return t > 0 && (Date.now() - t) < INSTALL_DISMISS_MS;
+}
+function canShowInstall() {
+  return !!deferredInstallPrompt && !isAppInstalled() && !installDismissedRecently();
+}
+
+function installBannerHTML() {
+  return `<div class="install-card" id="installCard" role="region" aria-label="Instalar Negocios de Caña CASUR">
+      <span class="install-card__glow" aria-hidden="true"></span>
+      <span class="install-card__flash" aria-hidden="true"></span>
+      <span class="install-card__icon"><img src="shared/assets/icons/icon-192.png" alt="" width="52" height="52"></span>
+      <span class="install-card__copy">
+        <b class="install-card__title">Instalar Negocios de Caña</b>
+        <small class="install-card__sub">Lleva la app en tu teléfono o PC</small>
+      </span>
+      <button class="install-card__cta" id="installCta" type="button">Instalar ahora</button>
+      <button class="install-card__close" id="installClose" type="button" aria-label="Descartar invitación">×</button>
+    </div>`;
+}
+function mountInstallBanner() {
+  const slot = $('#installSlot');
+  if (!slot) return; /* solo existe en el Home */
+  if (!canShowInstall()) { slot.innerHTML = ''; return; }
+  slot.innerHTML = installBannerHTML();
+  $('#installCta', slot).addEventListener('click', doInstall);
+  $('#installClose', slot).addEventListener('click', dismissInstall);
+  requestAnimationFrame(() => $('#installCard', slot)?.classList.add('is-in'));
+}
+function hideInstallBanner() {
+  const card = $('#installCard');
+  const slot = $('#installSlot');
+  if (card) {
+    card.classList.remove('is-in'); card.classList.add('is-out');
+    setTimeout(() => { if (slot) slot.innerHTML = ''; }, 280);
+  } else if (slot) { slot.innerHTML = ''; }
+}
+async function doInstall() {
+  const promptEvent = deferredInstallPrompt;
+  if (!promptEvent) return;
+  deferredInstallPrompt = null;
+  try {
+    await promptEvent.prompt();
+    const choice = await promptEvent.userChoice;
+    if (choice && choice.outcome === 'accepted') lsSet(INSTALL_KEYS.installed, '1');
+  } catch {}
+  hideInstallBanner();
+}
+function dismissInstall() {
+  lsSet(INSTALL_KEYS.dismissed, String(Date.now()));
+  hideInstallBanner();
+}
+
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  mountInstallBanner(); /* re-evalúa si el Home ya está visible */
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  lsSet(INSTALL_KEYS.installed, '1');
+  hideInstallBanner();
+});
+
+/* ---------- Generar paquete datos GitHub desde Centro Maestro ---------- */
+/* Carga Producción en un iframe oculto same-origin, espera a que:
+   1) consuma produccion_current (overlay → bridge → CRONO_DATA)
+   2) sincronice CASUR_RELEASE
+   3) CASUR_GENERATE_GITHUB_DATA_PACKAGE esté disponible
+   y entonces ejecuta la descarga. Si Producción ya está visible en #mFrame,
+   la usa directamente. Reutiliza el generador de Producción sin duplicar lógica. */
+async function generateGitHubPackageFromCentro() {
+  /* ¿Ya hay un iframe de Producción visible? */
+  const visible = $('#mFrame');
+  if (visible) {
+    try {
+      const fw = visible.contentWindow;
+      if (fw && typeof fw.CASUR_GENERATE_GITHUB_DATA_PACKAGE === 'function') {
+        await fw.CASUR_GENERATE_GITHUB_DATA_PACKAGE();
+        return;
+      }
+    } catch (_) { /* cross-origin o no cargado: caer al flujo con iframe oculto */ }
+  }
+
+  toast('Preparando paquete de datos…');
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+  iframe.src = 'modules/produccion/index.html';
+  document.body.appendChild(iframe);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Tiempo de espera agotado cargando Producción.')), 30000);
+      iframe.addEventListener('load', () => {
+        /* Esperar a que el bridge aplique y la API esté lista */
+        let checks = 0;
+        const poll = setInterval(() => {
+          checks++;
+          try {
+            const w = iframe.contentWindow;
+            if (w && typeof w.CASUR_GENERATE_GITHUB_DATA_PACKAGE === 'function' && w.CRONO_DATA && w.CRONO_DATA.global) {
+              clearInterval(poll); clearTimeout(timeout); resolve();
+            }
+          } catch (_) { /* todavía cargando */ }
+          if (checks > 120) { clearInterval(poll); clearTimeout(timeout); reject(new Error('Producción no inicializó la API de paquete.')); }
+        }, 250);
+      });
+      iframe.addEventListener('error', () => { clearTimeout(timeout); reject(new Error('No se pudo cargar Producción.')); });
+    });
+
+    await iframe.contentWindow.CASUR_GENERATE_GITHUB_DATA_PACKAGE();
+  } catch (err) {
+    toast('Error: ' + (err.message || err));
+  } finally {
+    setTimeout(() => { try { iframe.remove(); } catch (_) {} }, 2000);
+  }
+}
+
+/* [Fase 4.4.3] Comparador robusto de versiones de datos, duplicado a propósito
+   (no es lógica de negocio SIAGRI/Producción, es un utilitario genérico de
+   parseo de string) para no acoplar el shell al bundle de Producción.
+   Esquemas vigentes: "2026.09.05-siagri.1055" y "2026.09.01-2627.1". Valida
+   FECHA REAL (mes 1-12, día válido para ese mes, año en rango razonable) y
+   secuencia como entero seguro no negativo: rechaza fechas imposibles. */
+function parseCasurDataVersion(v) {
+  if (typeof v !== 'string') return null;
+  const m = v.match(/^(\d{4})\.(\d{2})\.(\d{2})-([a-zA-Z0-9]+)\.(\d+)$/);
+  if (!m) return null;
+  const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]), seq = Number(m[5]);
+  if (year < 2020 || year > 2100) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+  if (!Number.isSafeInteger(seq) || seq < 0) return null;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+  return { date: year * 10000 + month * 100 + day, seq };
+}
+function compareCasurDataVersions(a, b) {
+  if (a === b) return 0;
+  const pa = parseCasurDataVersion(a);
+  const pb = parseCasurDataVersion(b);
+  if (!pa || !pb) return null;
+  if (pa.date !== pb.date) return pa.date > pb.date ? 1 : -1;
+  if (pa.seq !== pb.seq) return pa.seq > pb.seq ? 1 : -1;
+  return 0;
+}
+
+/* [Fase 4.4.3] "Prepara" la actualización de datos de Producción desde Home,
+   sin exigir abrir el módulo. Desde este hotfix, un ÚNICO fetch a
+   version.json ya atraviesa el gate LKG del Service Worker raíz, que
+   internamente descarga y valida los 3 archivos (versión+cronológico+
+   histórico) como una GENERACIÓN completa y coherente, y promueve/activa
+   esa generación solo si es estrictamente más nueva (nunca downgrade, nunca
+   activación parcial) — ver sw.js: resolveGeneration(). El shell ya NO
+   duplica esa validación; solo dispara la resolución y sincroniza su propio
+   marcador local sin permitir jamás que retroceda. */
+async function prepareProduccionDataIfNewer() {
+  const GUARD_KEY = 'casur_prod_datacheck_at';
+  const GUARD_MS = 3 * 60 * 1000;
+  const last = Number(sessionStorage.getItem(GUARD_KEY) || 0);
+  if (Date.now() - last < GUARD_MS) return;
+  sessionStorage.setItem(GUARD_KEY, String(Date.now()));
+
+  const ACTIVE_KEY = 'casur_produccion_active_version';
+  try {
+    const res = await fetch(`modules/produccion/data/version.json?ts=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const resolved = await res.json();
+    if (!resolved || !resolved.version) return;
+    const active = localStorage.getItem(ACTIVE_KEY);
+    const cmp = active ? compareCasurDataVersions(resolved.version, active) : 1;
+    if (!active || cmp === 1 || cmp === 0) localStorage.setItem(ACTIVE_KEY, resolved.version);
+    /* cmp === -1 o null: NUNCA sobrescribir el marcador con algo inferior o irreconocible. */
+  } catch (e) { /* sin red o fallo de fetch: no hacer nada, no bloquear el Home */ }
+}
+
+/* ---------------- Vista: HOME ---------------- */
+function viewHome() {
+  const view = el(`<div class="view">
+    <header class="masthead">
+      <div class="masthead__brandrow">
+        <img class="masthead__logo" src="shared/assets/brand/casur-logo.png"
+             alt="CASUR · Compañía Azucarera del Sur, S.A." width="116" height="44">
+        <span class="emct" title="Edgardo Madrigal · Carlos Tijerino · Desarrollo">
+          <span class="emct__dot"></span>EM-CT</span>
+      </div>
+      <p class="masthead__eyebrow">Compañía Azucarera del Sur, S.A.</p>
+      <h1 class="masthead__title">Negocios de Caña</h1>
+      <p class="masthead__desc">Producción, estimación, riego, insumos y labores en un solo lugar.</p>
+    </header>
+    <div class="install-slot" id="installSlot"></div>
+    <div id="mods"></div>
+  </div>`);
+  const host = $('#mods', view);
+  const online = status.isOnline();
+
+  registry.homeGroups().forEach((group) => {
+    const section = el(`<section class="section" aria-label="${group.title}">
+        <div class="section__head">
+          <h2 class="section__title">${group.title}</h2>
+          <span class="section__note">${group.note}</span>
+        </div>
+        <div class="modules"></div>
+      </section>`);
+    const grid = $('.modules', section);
+    group.modules.forEach((m) => {
+      let chip;
+      if (m.usesSupabase) {
+        chip = online
+          ? `<span class="chip is-online"><span class="chip__dot"></span>Requiere conexión</span>`
+          : `<span class="chip is-offline"><span class="chip__dot"></span>Sin conexión</span>`;
+      } else {
+        chip = `<span class="chip is-local"><span class="chip__dot"></span>Se descarga al abrir</span>`;
+      }
+      const card = el(`<button data-offline-module="${m.moduleId}" class="mod-card" type="button" style="--accent:${m.accent}">
+          <span class="mod-card__tile">${icon(m.icon)}</span>
+          <span class="mod-card__body">
+            <span class="mod-card__name">${m.name}</span>
+            <span class="mod-card__desc">${m.desc}</span>
+            <span class="mod-card__meta">
+              ${chip}
+              <span class="chip is-version">${String(m.version).replace(/^v?/i, 'v')}</span>
+            </span>
+          </span>
+          <span class="mod-card__go">${icon('chevron')}</span>
+        </button>`);
+      card.addEventListener('click', () => router.go('/modulo/' + m.moduleId));
+      grid.appendChild(card);
+    });
+    host.appendChild(section);
+  });
+
+  swap(view);
+  renderNav('home');
+  mountInstallBanner();
+  void refreshBundleAvailability();
+}
+
+async function refreshBundleAvailability(){
+ if(!navigator.serviceWorker?.controller)return;
+ try{const result=await new Promise((resolve,reject)=>{const c=new MessageChannel(),t=setTimeout(()=>reject(Error('status')),5000);c.port1.onmessage=e=>{clearTimeout(t);c.port1.close();resolve(e.data);};navigator.serviceWorker.controller.postMessage({type:'BUNDLE_STATUS'},[c.port2]);});
+ for(const [id,ready] of Object.entries(result.bundles)){const card=document.querySelector('[data-offline-module="'+id+'"] .chip.is-local');if(card)card.lastChild.textContent=ready?'Disponible sin conexión':'Se descarga al abrir';}
+ }catch{}
+}
+
+/* ---------------- Vista: MÓDULO (iframe) ---------------- */
+function viewModule(id) {
+  const m = registry.byId(id);
+  if (!m) { router.home(); return; }
+
+  // Guardas: privado requiere desbloqueo; desactivado no entra.
+  if (m.privacy === 'private' && !gate.isUnlocked()) { router.go('/privado/' + id); return; }
+  if (!m.enabled) { router.home(); return; }
+
+  const host = el(`<div class="module-host view" data-module-id="${id}" data-rendered-route="/modulo/${id}">
+      <div class="module-host__bar">
+        <button class="icon-btn" id="mBack" type="button" aria-label="Volver">${icon('back')}</button>
+        <button class="module-host__crumb" id="mCrumb" type="button">Inicio</button>
+        <button class="module-host__switch" id="mSwitch" type="button"
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="moduleSwitcher">
+          <span class="module-host__title">${m.name}</span>
+          <span class="module-host__switch-caret" aria-hidden="true">▾</span>
+        </button>
+        <span class="module-host__spacer"></span>
+        <button class="icon-btn" id="mReload" type="button" aria-label="Recargar módulo">${icon('refresh')}</button>
+      </div>
+      ${id === 'produccion' ? '<div class="module-host__startup" id="productionStartup" role="status" aria-live="polite"><div class="module-host__startup-card"><img src="modules/produccion/assets/negocios-de-cana.webp" alt="" width="144" height="144"><div><strong>Maestro de Suertes</strong><span>Preparando datos seguros…</span><p hidden>No se pudo abrir Maestro. Revisá la conexión y volvé a intentarlo.</p><div id="startupRecovery" hidden><button type="button" id="startupRetry">Reintentar</button><button type="button" id="startupHome">Volver al Inicio</button></div></div></div><div class="module-host__startup-skeleton" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>' : ''}
+      <iframe class="module-host__frame" id="mFrame"
+              data-casur-src="${m.route}"
+              title="${m.name}"
+              allow="camera; geolocation; clipboard-read; clipboard-write; fullscreen"
+              referrerpolicy="no-referrer"></iframe>
+      <div class="module-switcher" id="moduleSwitcher" hidden>
+        <div class="module-switcher__backdrop" data-switch-close></div>
+        <section class="module-switcher__panel" role="dialog" aria-modal="true" aria-labelledby="moduleSwitcherTitle">
+          <header class="module-switcher__head">
+            <div><small>ACCESO RÁPIDO</small><strong id="moduleSwitcherTitle">Cambiar módulo</strong></div>
+            <button class="icon-btn module-switcher__close" type="button" data-switch-close aria-label="Cerrar selector">${icon('close')}</button>
+          </header>
+          <div class="module-switcher__list" id="moduleSwitcherList" role="menu"></div>
+        </section>
+      </div>
+    </div>`);
+
+  // Conservar Inicio durante una transición caliente, sin mostrar el iframe prematuro.
+  const previousView = id === 'produccion' && navigator.serviceWorker?.controller && !viewEl.querySelector('#mFrame') ? viewEl.firstElementChild : null;
+  if (previousView) { previousView.inert = true; host.classList.add('module-host--pending'); }
+  else { document.body.classList.add('in-module'); viewEl.innerHTML = ''; }
+  const showHost = () => {
+    if (!host.isConnected) return;
+    if (previousView?.isConnected) previousView.remove();
+    document.body.classList.add('in-module');
+    host.classList.remove('module-host--pending');
+  };
+  const frame = $('#mFrame', host);
+  let startupFailed = false, startupComplete = false, startupStage = 'sw-ready';
+  const diagnostic = (stage, status) => { window.CASUR_STARTUP_DIAGNOSTIC = {stage, status, at: Date.now()}; };
+  const failStartup = error => {
+    if (startupComplete || startupFailed || !host.isConnected) return;
+    startupFailed = true; diagnostic(startupStage, error?.message || 'timeout'); showHost();
+    if(id!=='produccion'){toast('No se pudo preparar el módulo. Conectate para descargarlo y volvé a intentarlo.');void navigateFromActiveModule('/', 'bundle-unavailable');return;}
+    const note = host.querySelector('#productionStartup p'); if (note) note.hidden = false;
+    const actions = host.querySelector('#startupRecovery'); if (actions) actions.hidden = false;
+  };
+  const deadline = id === 'produccion' ? setTimeout(failStartup, 45000) : null;
+  const revealProduction = () => {
+    if (id !== 'produccion' || !frame.isConnected || startupFailed) return;
+    try {
+      const child = frame.contentWindow;
+      if (child?.CASUR_PRODUCTION_READY && child.document.body?.classList.contains('casur-maestro-premium') && child.document.querySelector('#casurStartup')?.hidden) {
+        startupComplete = true; clearTimeout(deadline); diagnostic('visible', 'ready');
+        host.querySelector('#productionStartup')?.remove();
+        showHost();
+        return;
+      }
+    } catch { /* Navigation can be in progress; keep the safe loading state. */ }
+    setTimeout(revealProduction, 40);
+  };
+  frame.addEventListener('load', () => { if(frame.contentWindow?.location.href==='about:blank')return; try { const root = frame.contentDocument.documentElement; root.classList.add('casur-embedded'); root.dataset.casurModule = id; } catch { /* módulo aún navegando */ } protectModuleActivity(frame.contentWindow); void consumePendingModuleContext(frame, id); });
+  if (id === 'produccion') setTimeout(revealProduction, 0);
+  viewEl.appendChild(host);
+  if (previousView) setTimeout(showHost, 1200);
+  host.querySelector('#startupRetry')?.addEventListener('click', async () => { const saved = await checkpointActiveModule('retry-startup'); if (saved.ok) location.reload(); else toast(MODULE_CHECKPOINT_ERROR); });
+  host.querySelector('#startupHome')?.addEventListener('click', () => { void navigateFromActiveModule('/', 'back-home'); });
+  // First-use Production scripts must already be behind the verified SW data gate.
+  void (async()=>{
+    if('serviceWorker' in navigator && location.protocol!=='file:'){
+      diagnostic('sw-ready', 'waiting');
+      await Promise.race([navigator.serviceWorker.ready, new Promise((_, reject) => setTimeout(() => reject(new Error('sw-ready-timeout')), 40000))]);
+      if (startupFailed) return;
+      startupStage = 'sw-controller'; diagnostic(startupStage, 'waiting');
+      if (!navigator.serviceWorker.controller) await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { navigator.serviceWorker.removeEventListener('controllerchange', changed); reject(new Error('sw-controller-timeout')); }, 40000);
+        const changed = () => { if (navigator.serviceWorker.controller) { clearTimeout(timer); navigator.serviceWorker.removeEventListener('controllerchange', changed); resolve(); } };
+        navigator.serviceWorker.addEventListener('controllerchange', changed); changed();
+      });
+    }
+    if (frame.isConnected && !startupFailed) {
+      startupStage='bundle-'+id; diagnostic(startupStage,'waiting');
+      const manifest=await (await fetch('core/versions/runtime-assets.json')).json();
+      await new Promise((resolve,reject)=>{
+        const channel=new MessageChannel();
+        let timer; const arm=()=>{clearTimeout(timer);timer=setTimeout(()=>{channel.port1.close();reject(new Error('bundle-timeout'));},30000);};arm();
+        channel.port1.onmessage=({data})=>{if(data.releaseId!==manifest.releaseId)return;if(data.type==='PROGRESS'){arm();return;}clearTimeout(timer);channel.port1.close();data.type==='READY'?resolve():reject(new Error(data.code||'bundle-error'));};
+        navigator.serviceWorker.controller.postMessage({type:'PREPARE_BUNDLE',bundleId:id,releaseId:manifest.releaseId},[channel.port2]);
+      });
+      if(['produccion','tch'].includes(id))navigator.serviceWorker.controller.postMessage({type:'WARM_GEO'});
+      startupStage='iframe-readiness';diagnostic(startupStage,'waiting');frame.src=m.route;
+    }
+  })().catch(failStartup);
+
+  $('#mBack', host).addEventListener('click', () => { void navigateFromActiveModule('/', 'back-home'); });
+  $('#mCrumb', host).addEventListener('click', () => { void navigateFromActiveModule('/', 'back-home'); });
+  $('#mReload', host).addEventListener('click', () => { void reloadActiveModule(); });
+
+  const trigger = $('#mSwitch', host);
+  const switcher = $('#moduleSwitcher', host);
+  const panel = $('.module-switcher__panel', switcher);
+  const list = $('#moduleSwitcherList', switcher);
+
+  const closeSwitcher = ({ returnFocus = true } = {}) => {
+    if (switcher.hidden) return;
+    switcher.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    document.body.classList.remove('module-switcher-open');
+    if (returnFocus) trigger.focus();
+  };
+
+  const renderSwitcherModules = (activeContext = null) => {
+    list.innerHTML = '';
+    registry.homeModules().forEach((target) => {
+      const current = target.moduleId === id;
+      const contextualLot = target.moduleId === 'produccion' ? activeContext : null;
+      const connectivity = target.requiresOnline
+        ? `<small class="module-switcher__status ${status.isOnline() ? '' : 'is-offline'}">${status.isOnline() ? 'Requiere conexión' : 'Sin conexión'}</small>`
+        : '';
+      const entry = el(`<div class="module-switcher__entry" role="none" style="--accent:${target.accent}">
+          <button class="module-switcher__option ${current ? 'is-current' : ''}"
+            type="button" role="menuitem" data-switch-module="${target.moduleId}"
+            ${current ? 'aria-current="page"' : ''}>
+            <span class="module-switcher__logo">${icon(target.icon)}</span>
+            <span class="module-switcher__copy"><strong>${target.name}</strong>${connectivity}</span>
+            <span class="module-switcher__mark" aria-hidden="true">${current ? '✓' : '›'}</span>
+          </button>
+          ${contextualLot ? `<button class="module-switcher__context" type="button" role="menuitem"
+            data-switch-context-lot="${contextualLot.lotId}" aria-label="Ver Suerte ${contextualLot.lotId} en Maestro de Suertes">↳ Ver Suerte ${contextualLot.lotId}</button>` : ''}
+        </div>`);
+      list.appendChild(entry);
+    });
+  };
+
+  const openSwitcher = () => {
+    renderSwitcherModules(getActiveLotContext(id));
+    switcher.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    document.body.classList.add('module-switcher-open');
+    $('[aria-current="page"]', list)?.focus();
+  };
+
+  trigger.addEventListener('click', () => switcher.hidden ? openSwitcher() : closeSwitcher());
+  switcher.addEventListener('click', (event) => {
+    if (event.target.closest('[data-switch-close]')) { closeSwitcher(); return; }
+    const contextual = event.target.closest('[data-switch-context-lot]');
+    if (contextual) {
+      const context = getActiveLotContext(id);
+      if (!context || context.lotId !== contextual.dataset.switchContextLot) { closeSwitcher(); return; }
+      closeSwitcher({ returnFocus: false });
+      void navigateFromActiveModule('/modulo/produccion', 'module-context', {
+        targetModuleId: 'produccion', context: { ...context },
+      });
+      return;
+    }
+    const option = event.target.closest('[data-switch-module]');
+    if (!option) return;
+    const targetId = option.dataset.switchModule;
+    if (targetId === id) { closeSwitcher(); return; }
+    closeSwitcher({ returnFocus: false });
+    void navigateFromActiveModule('/modulo/' + targetId, 'module-switch');
+  });
+  host.addEventListener('keydown', (event) => {
+    if (switcher.hidden) return;
+    if (event.key === 'Escape') { event.preventDefault(); closeSwitcher(); return; }
+    if (event.key !== 'Tab') return;
+    const focusable = [...panel.querySelectorAll('button:not([disabled])')];
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault(); first.focus();
+    }
+  });
+}
+
+/* ---------------- Vista: CENTRO MAESTRO ---------------- */
+async function viewCentroMaestro() {
+  const mods = registry.all();
+  const view = el(`<div class="view panel">
+      <div class="panel__top">
+        <div>
+          <h1 class="panel__title">Centro Maestro</h1>
+          <p class="panel__note">Administración de módulos, estado del sistema y datos.</p>
+        </div>
+        <button class="btn" id="centroLock" type="button">${icon('lock')} Bloquear</button>
+      </div>
+
+      <section class="card">
+        <div class="card__head"><span class="card__title">Módulos</span>
+          <span class="chip"><span class="chip__dot"></span>${mods.length} registrados</span></div>
+        <div id="mrows"></div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><span class="card__title">Estado</span></div>
+        <div class="stat-grid" id="stats"></div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><span class="card__title">Gestión de datos</span></div>
+        <p class="panel__note">Cada módulo conserva su propia forma de importar y actualizar datos
+        (principio: <strong>primero preservar, después centralizar</strong>). El Convertidor SIAGRI
+        se administra desde aquí.</p>
+        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap">
+          <button class="btn" id="openConv" type="button">${icon('siagri')} Administrador SIAGRI</button>
+          <button class="btn" id="openPriv" type="button">${icon('lock')} Área privada</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card__head"><span class="card__title">Maestro de datos · SIAGRI → Suertes</span></div>
+        <p class="panel__note">Reutiliza el dataset ya validado en Administrador SIAGRI (sin volver a cargar el
+        Excel) para actualizar <strong>Maestro de Suertes</strong>. El adaptador mapea al formato REPORTE y valida
+        <strong>Sucuya = 0</strong>, llave Hac-Sue, duplicados e integridad antes de aplicar. El histórico no se destruye.</p>
+        <div class="stat-grid" id="dataStatus" style="margin-top:10px"></div>
+        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap">
+          <button class="btn btn-green" id="updateProduccion" type="button">Actualizar Maestro de Suertes</button>
+          <button class="btn" id="openOperational" type="button">Importar inventario / aforo por contenido</button>
+          <button class="btn" id="restoreLocalProduction" type="button" hidden>Usar generación local guardada</button>
+          <button class="btn" id="genPackage" type="button">Generar paquete datos GitHub</button>
+        </div>
+        <p class="panel__note" style="margin-top:8px; opacity:.8">El paquete de datos (cronologico/historico/version)
+        lo genera el propio Centro Maestro de Producción (botón «Paquete solo datos para GitHub»), ya con los datos
+        aplicados. Versión de <em>datos</em> ≠ versión de <em>código</em> (VF54.8).</p>
+      </section>
+
+      <section class="card" id="pinCard"></section>
+
+      <section class="card">
+        <div class="card__head"><span class="card__title">Versiones</span></div>
+        <div class="stat-grid" id="vers"></div>
+      </section>
+    </div>`);
+
+  // --- Filas de módulos con interruptor y visibilidad ---
+  const rows = $('#mrows', view);
+  mods.forEach((m) => {
+    const row = el(`<div class="mrow" style="--accent:${m.accent}">
+        <span class="mrow__tile">${icon(m.icon)}</span>
+        <span class="mrow__body">
+          <span class="mrow__name">${m.name}</span>
+          <span class="mrow__meta">${m.privacy} · ${m.version} · ${m.requiresOnline ? 'requiere red' : 'offline'}${m.usesSupabase ? ' · Supabase' : ''} · ${moduleStatus(m.moduleId)}</span>
+        </span>
+        <label class="switch" title="Activar módulo">
+          <input type="checkbox" ${m.enabled ? 'checked' : ''}>
+          <span class="switch__track"></span><span class="switch__thumb"></span>
+        </label>
+      </div>`);
+    $('input', row).addEventListener('change', (e) => {
+      registry.setOverride(m.moduleId, { enabled: e.target.checked });
+    });
+    rows.appendChild(row);
+  });
+
+  // --- Estado ---
+  const est = await status.storageEstimate();
+  const caches = await status.listCaches();
+  $('#stats', view).innerHTML = `
+    <div class="stat"><div class="stat__label">App Maestra</div><div class="stat__value">v${APP_VERSION}</div></div>
+    <div class="stat"><div class="stat__label">Canal</div><div class="stat__value">${APP_CHANNEL}</div></div>
+    <div class="stat"><div class="stat__label">Conectividad</div><div class="stat__value">${status.isOnline() ? 'En línea' : 'Offline'}</div></div>
+    <div class="stat"><div class="stat__label">Almacenamiento</div><div class="stat__value">${est ? est.usageMB + ' MB' : '—'}</div></div>
+    <div class="stat"><div class="stat__label">Cuota</div><div class="stat__value">${est ? est.quotaMB + ' MB' : '—'}</div></div>
+    <div class="stat"><div class="stat__label">Uso</div><div class="stat__value">${est ? est.pct + ' %' : '—'}</div></div>
+    <div class="stat"><div class="stat__label">Cachés</div><div class="stat__value">${caches.length}</div></div>
+    <div class="stat"><div class="stat__label">Service Worker</div><div class="stat__value">${'serviceWorker' in navigator ? 'Activo' : 'N/D'}</div></div>`;
+
+  // --- Versiones ---
+  $('#vers', view).innerHTML = registry.all().map((m) =>
+    `<div class="stat"><div class="stat__label">${m.name}</div><div class="stat__value">${m.version}</div></div>`
+  ).join('');
+
+  // --- Acciones ---
+  $('#centroLock', view).addEventListener('click', () => { gate.centroLock(); router.home(); });
+  $('#openConv', view).addEventListener('click', () => router.go('/modulo/convertidor'));
+  $('#openPriv', view).addEventListener('click', () => router.go('/privado'));
+
+  // --- Estado de datos maestros (SIAGRI → Suertes) ---
+  renderDataStatus(view);
+  $('#updateProduccion', view).addEventListener('click', () => updateProduccionFromSiagri());
+  $('#openOperational', view).addEventListener('click', () => { sessionStorage.setItem('casur-operational-open','1'); router.go('/modulo/produccion'); });
+  $('#restoreLocalProduction', view).addEventListener('click', () => {
+    try { localStorage.setItem('casur-production-source','personal'); }
+    catch { toast('No se pudo guardar la elección. La generación guardada se conserva.'); return; }
+    router.go('/modulo/produccion');
+  });
+  $('#genPackage', view).addEventListener('click', () => generateGitHubPackageFromCentro());
+
+  // Tarjeta de PIN: SOLO permite cambiarlo si el área privada ya está
+  // desbloqueada en esta sesión. Si está bloqueada, ofrece desbloquear.
+  (function renderPinCard() {
+    const card = $('#pinCard', view);
+    if (gate.isUnlocked()) {
+      card.innerHTML = `
+        <div class="card__head"><span class="card__title">Seguridad del área privada</span>
+          <span class="chip is-ok"><span class="chip__dot"></span>Desbloqueada</span></div>
+        <p class="panel__note">Cambia el PIN de desbloqueo. Es solo una barrera de interfaz para
+        evitar accesos accidentales de otros usuarios; el repositorio es público y el PIN no cifra datos.</p>
+        <div class="dialog__row" style="margin-top:12px">
+          <div class="field" style="flex:1">
+            <label for="newPin">Nuevo PIN</label>
+            <input id="newPin" inputmode="numeric" autocomplete="off" placeholder="••••">
+          </div>
+          <button class="btn btn--primary" id="savePin" type="button" style="align-self:end">Guardar</button>
+        </div>`;
+      $('#savePin', card).addEventListener('click', () => {
+        const v = $('#newPin', card).value.trim();
+        if (v.length >= 3) { gate.setPin(v); $('#newPin', card).value = ''; toast('PIN actualizado'); }
+        else toast('El PIN debe tener al menos 3 dígitos');
+      });
+    } else {
+      card.innerHTML = `
+        <div class="card__head"><span class="card__title">Seguridad del área privada</span>
+          <span class="chip is-offline"><span class="chip__dot"></span>Bloqueada</span></div>
+        <p class="panel__note">Para cambiar el PIN primero debes desbloquear el área privada.</p>
+        <button class="btn" id="unlockForPin" type="button" style="margin-top:12px">${icon('lock')} Desbloquear área privada</button>`;
+      $('#unlockForPin', card).addEventListener('click', () => router.go('/privado'));
+    }
+  })();
+
+  swap(view);
+  renderNav('centro-maestro');
+}
+
+/* ---------------- Vista: PRIVADO (gate) ---------------- */
+function viewPrivado(pendingModuleId) {
+  if (!gate.isUnlocked()) { renderGate(pendingModuleId); return; }
+
+  const privateMods = registry.all().filter((m) => m.privacy === 'private');
+  const view = el(`<div class="view panel">
+      <div>
+        <h1 class="panel__title">Área privada</h1>
+        <p class="panel__note">Datos económicos de conciliación. Visible solo para el propietario.</p>
+      </div>
+      <section class="card"><div id="privRows"></div></section>
+      <button class="btn btn--block" id="lockBtn" type="button">${icon('lock')} Bloquear área privada</button>
+    </div>`);
+
+  const rows = $('#privRows', view);
+  privateMods.forEach((m) => {
+    const row = el(`<div class="mrow" style="--accent:${m.accent}">
+        <span class="mrow__tile">${icon(m.icon)}</span>
+        <span class="mrow__body"><span class="mrow__name">${m.name}</span>
+          <span class="mrow__meta">${m.desc} · ${m.version}</span></span>
+        <span class="mod-card__go">${icon('chevron')}</span>
+      </div>`);
+    row.style.cursor = 'pointer';
+    row.addEventListener('click', () => router.go('/modulo/' + m.moduleId));
+    rows.appendChild(row);
+  });
+
+  $('#lockBtn', view).addEventListener('click', () => { gate.lock(); router.home(); });
+
+  swap(view);
+  renderNav('centro-maestro');
+}
+
+function renderGate(pendingModuleId) {
+  const view = el(`<div class="view panel"><div>
+      <h1 class="panel__title">Área privada</h1>
+      <p class="panel__note">Introduce el PIN para desbloquear.</p></div></div>`);
+  swap(view);
+  renderNav('centro-maestro');
+
+  const overlay = el(`<div class="overlay">
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="gTitle">
+        <h2 class="dialog__title" id="gTitle">Desbloquear</h2>
+        <p class="dialog__note">Este acceso es solo para el propietario (Carlos).</p>
+        <div class="field">
+          <label for="pin">PIN</label>
+          <input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="••••">
+          <small class="dialog__note">Guía PIN TV</small>
+        </div>
+        <p class="dialog__err" id="gErr"></p>
+        <div class="dialog__row">
+          <button class="btn btn--block" id="gCancel" type="button">Cancelar</button>
+          <button class="btn btn--primary btn--block" id="gOk" type="button">Entrar</button>
+        </div>
+      </div></div>`);
+  document.body.appendChild(overlay);
+  const input = $('#pin', overlay);
+  input.focus();
+
+  const close = () => overlay.remove();
+  const attempt = () => {
+    if (gate.unlock(input.value)) {
+      close();
+      renderNav('centro-maestro');
+      if (pendingModuleId) router.go('/modulo/' + pendingModuleId);
+      else viewPrivado();
+    } else {
+      $('#gErr', overlay).textContent = 'PIN incorrecto.';
+      input.select();
+    }
+  };
+  $('#gOk', overlay).addEventListener('click', attempt);
+  $('#gCancel', overlay).addEventListener('click', () => { close(); router.home(); });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') attempt(); });
+}
+
+/* ---------------- Utilidades de vista ---------------- */
+function swap(view) {
+  document.body.classList.remove('in-module');
+  viewEl.innerHTML = '';
+  viewEl.appendChild(view);
+  window.scrollTo(0, 0);
+}
+
+let toastTimer = null;
+function toast(msg, action) {
+  const old = $('#toast'); if (old) old.remove();
+  const t = el(`<div class="toast" id="toast"><span>${msg}</span></div>`);
+  if (action) {
+    const b = el(`<button class="btn btn--primary" type="button">${action.label}</button>`);
+    b.addEventListener('click', action.onClick);
+    t.appendChild(b);
+  }
+  document.body.appendChild(t);
+  clearTimeout(toastTimer);
+  if (!action) toastTimer = setTimeout(() => t.remove(), 2600);
+}
+
+/* ---------------- Datos maestros: SIAGRI → Suertes ---------------- */
+/* Lee el último dataset procesado por el Convertidor (puente no invasivo:
+   el Convertidor lo persiste en casur_master_data/datasets/siagri_last). */
+async function readSiagriBridge() {
+  try {
+    const db = await new Promise((res, rej) => {
+      const q = indexedDB.open(masterStore.MASTER_STORE_INFO.DB_NAME, masterStore.MASTER_STORE_INFO.DB_VERSION);
+      q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
+    });
+    const rec = await new Promise((res) => {
+      const tx = db.transaction(masterStore.MASTER_STORE_INFO.STORE, 'readonly');
+      const r = tx.objectStore(masterStore.MASTER_STORE_INFO.STORE).get('siagri_last');
+      r.onsuccess = () => res(r.result || null); r.onerror = () => res(null);
+    });
+    db.close();
+    return rec ? rec.payload : null;
+  } catch { return null; }
+}
+
+async function renderDataStatus(view) {
+  const box = $('#dataStatus', view); if (!box) return;
+  const prod = await masterStore.getProduccionStatus();
+  const siagri = await readSiagriBridge();
+  /* [Fase 6.2] Backfill no destructivo: si ya existe produccion_current
+     válido pero todavía no existe maestro_suertes_current (dispositivos
+     que actualizaron Producción antes de este hotfix), lo construye desde
+     sus reportRows ya persistidos, sin volver a procesar Excel ni tocar
+     produccion_current. */
+  let maestro = await masterStore.getMaestroStatus();
+  if (!maestro.present && prod.present) {
+    try {
+      const prodRec = await masterStore.loadProduccionDataset();
+      const rows = prodRec && prodRec.payload && prodRec.payload.reportRows;
+      if (rows && rows.length) {
+        const central = buildMaestroCentralFromReportRows(rows, { dataVersion: prod.dataVersion, generatedAt: prodRec.savedAt });
+        if (central) { await masterStore.saveMaestroSuertes(central); maestro = await masterStore.getMaestroStatus(); }
+      }
+    } catch (e) { /* backfill best-effort; no bloquea la vista */ }
+  }
+  const fmt = (d) => d ? new Date(d).toLocaleDateString('es-NI') : '—';
+  const official = localStorage.getItem('casur-production-source') === 'official';
+  const shared = localStorage.getItem('casur-data-last-shared');
+  $('#restoreLocalProduction', view).hidden = !prod.present || !official;
+  box.innerHTML = `
+    <div class="stat"><div class="stat__label">Maestro SIAGRI (procesado)</div>
+      <div class="stat__value">${siagri ? (siagri.records ? siagri.records.length : '—') + ' suertes' : 'Sin procesar'}</div></div>
+    <div class="stat"><div class="stat__label">SIAGRI · fuente</div>
+      <div class="stat__value">${siagri && siagri.meta ? (siagri.meta.source || 'SIAGRI') : '—'}</div></div>
+    <div class="stat"><div class="stat__label">Producción · fuente efectiva</div>
+      <div class="stat__value">${official || !prod.present ? 'Oficial · ' + (shared || 'data/*') : 'Local · ' + (prod.dataVersion || 'guardada')}</div></div>
+    <div class="stat"><div class="stat__label">Maestro de Suertes · generación local guardada</div>
+      <div class="stat__value">${prod.present ? (prod.dataVersion || 'aplicado') : 'Sin aplicar (usa data/*)'}</div></div>
+    <div class="stat"><div class="stat__label">Aplicado</div>
+      <div class="stat__value">${prod.present ? fmt(prod.savedAt) : '—'}</div></div>
+    <div class="stat"><div class="stat__label">Maestro Central · Riego</div>
+      <div class="stat__value">${maestro.present ? `versión ${maestro.version} · ${maestro.rows} suertes` : 'Sin publicar aún'}</div></div>`;
+}
+
+async function baselineReportRows() {
+  /* Segunda actualización en adelante: baseline = último produccion_current. */
+  const prev = await masterStore.loadProduccionDataset();
+  if (prev && prev.payload && Array.isArray(prev.payload.reportRows) && prev.payload.reportRows.length) {
+    return prev.payload.reportRows;
+  }
+  /* Primera actualización: baseline = datos actualmente publicados en Producción
+     (reutiliza su cronológico agregado; no reconstruye reglas). Evita "0 anteriores". */
+  try {
+    const res = await fetch('modules/produccion/data/cronologico.json', { cache: 'no-store' });
+    const j = await res.json();
+    const rows = [];
+    (j.producers || []).forEach((p) => (p.details || []).forEach((d) => rows.push({
+      'Hac-Sue': String(d.codLote || d.hhhsss || ((p.code || '') + '' + (d.suerte || ''))),
+      Area: d.area,
+      Variedad: d.variedad,
+      '#_de_Corte': d.corte,
+      'F. Siembra': d.fSiembra,
+      'F. Ult. Cte': d.fUltCte,
+      Destino: d.destino,
+      Tenencia: d.tenencia,
+      Tipo_de_Riego: d.tipoRiego,
+      '#_de_Riegos': (d.numeroRiegos != null ? d.numeroRiegos : null),
+      ZONA: d.zona,
+      TCH_Z2526: (d.tch != null ? d.tch : null),
+      Estado: (d.estado != null ? d.estado : ''),
+      TCH_Estimado_Z2627: (d.tchEst2627 != null ? d.tchEst2627 : null),
+    })));
+    return rows;
+  } catch { return []; }
+}
+
+async function updateProduccionFromSiagri() {
+  const siagri = await readSiagriBridge();
+  if (!siagri || !siagri.records || !siagri.records.length) {
+    toast('Primero procesa un SIAGRI en Administrador SIAGRI.');
+    return;
+  }
+  const prevRows = await baselineReportRows();
+  const result = adaptSiagriToProduction(siagri, prevRows);
+
+  const s = result.summary;
+  const vlines = result.validations.checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.detail}`).join('\n');
+  const desglose = Object.keys(s.fieldCounts || {}).sort((a, b) => s.fieldCounts[b] - s.fieldCounts[a])
+    .map((k) => `   · ${k}: ${s.fieldCounts[k]}`).join('\n');
+  const resumen =
+    `Actualizar Maestro de Suertes\n` +
+    `--------------------------------\n` +
+    `Registros anteriores: ${s.registrosAnteriores}\n` +
+    `Registros nuevos: ${s.registrosNuevos}\n` +
+    `Nuevas suertes: ${s.nuevasSuertes}\n` +
+    `Modificadas: ${s.modificadas}\n` +
+    `Sin cambios: ${s.sinCambios}\n` +
+    `Inactivadas/retiradas: ${s.inactivadas}\n` +
+    (desglose ? `Cambios por variable:\n${desglose}\n` : '') +
+    `Área anterior: ${s.areaAnterior} ha → nueva: ${s.areaNueva} ha (Δ ${s.areaDelta})\n` +
+    `Sucuya excluida (Cod 16): ${s.sucuyaExcluidas}\n` +
+    `Fecha de actualización: ${s.fechaActualizacion}\n` +
+    `Versión de datos: ${result.dataVersion}\n` +
+    `--------------------------------\n` +
+    `Validaciones:\n${vlines}\n` +
+    `--------------------------------\n` +
+    (result.ok ? '¿Aplicar esta actualización?' : 'NO se puede aplicar: hay validaciones críticas sin cumplir.');
+
+  if (!result.ok) { window.alert(resumen); return; }
+  if (!window.confirm(resumen)) { toast('Actualización cancelada. No se aplicó ningún cambio.'); return; }
+
+  await masterStore.saveProduccionDataset({
+    reportRows: result.reportRows,
+    dataVersion: result.dataVersion,
+    summary: s,
+    meta: result.meta,
+    /* El histórico NO se toca aquí: Producción lo conserva/ampl­ía con sus reglas. */
+  });
+
+  /* [Fase 6.2] Publicar también el Maestro Central de Suertes (subconjunto
+     CENTRAL: farmCode/farmName/lot/area/variety/irrigationType/texture/
+     zone/cropStartDate/erp) en la MISMA actualización — sin un botón
+     separado. Riego lo recibe automáticamente al abrir/recargar, leyendo
+     el Cronológico publicado; esto solo deja disponible una copia
+     canónica adicional en el shell (consistencia + backfill). Nunca
+     retrocede: se compara contra lo ya guardado con el mismo comparador
+     entero-de-secuencia usado en todo el proyecto. */
+  try {
+    const central = buildMaestroCentralFromReportRows(result.reportRows, { dataVersion: result.dataVersion, generatedAt: new Date().toISOString() });
+    if (central) {
+      const prevMaestro = await masterStore.loadMaestroSuertes();
+      const prevVersion = prevMaestro && prevMaestro.payload && prevMaestro.payload.version;
+      const cmp = prevVersion ? compareMaestroVersions(central.version, prevVersion) : 1;
+      if (!prevVersion || cmp === 1) await masterStore.saveMaestroSuertes(central);
+    }
+  } catch (e) { /* el Maestro Central es un valor agregado; nunca bloquea la actualización de Producción */ }
+
+  toast('Maestro de Suertes actualizado en este dispositivo. Genera el paquete para publicar.');
+  const v = $('#view'); if (v) renderDataStatus(v);
+}
+
+/* ---------------- Gate de Centro Maestro ---------------- */
+function renderCentroGate() {
+  const view = el(`<div class="view panel"><div>
+      <h1 class="panel__title">Centro Maestro</h1>
+      <p class="panel__note">Introduce la contraseña para acceder a la administración.</p></div></div>`);
+  swap(view);
+  renderNav('centro-maestro');
+
+  const overlay = el(`<div class="overlay">
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="cTitle">
+        <h2 class="dialog__title" id="cTitle">Acceso restringido</h2>
+        <p class="dialog__note">El Centro Maestro es de uso administrativo.</p>
+        <div class="field">
+          <label for="cpass">Contraseña</label>
+          <input id="cpass" type="password" inputmode="numeric" autocomplete="off" placeholder="••••••">
+        </div>
+        <p class="dialog__err" id="cErr"></p>
+        <div class="dialog__row">
+          <button class="btn btn--block" id="cCancel" type="button">Cancelar</button>
+          <button class="btn btn--primary btn--block" id="cOk" type="button">Entrar</button>
+        </div>
+      </div></div>`);
+  document.body.appendChild(overlay);
+  const input = $('#cpass', overlay);
+  input.focus();
+
+  const close = () => overlay.remove();
+  const attempt = () => {
+    if (gate.centroUnlock(input.value)) { close(); viewCentroMaestro(); }
+    else { $('#cErr', overlay).textContent = 'Contraseña incorrecta.'; input.select(); }
+  };
+  $('#cOk', overlay).addEventListener('click', attempt);
+  $('#cCancel', overlay).addEventListener('click', () => { close(); router.home(); });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') attempt(); });
+}
+
+/* ---------------- Router → vistas ---------------- */
+function routePath(r) {
+  if (r.name === 'modulo') return '/modulo/' + (r.param || '');
+  if (r.name === 'centro-maestro') return '/centro-maestro';
+  if (r.name === 'privado') return '/privado/' + (r.param || '');
+  return '/';
+}
+
+function renderRoute(r) {
+  switch (r.name) {
+    case 'home': viewHome(); break;
+    case 'modulo': viewModule(r.param); break;
+    case 'centro-maestro':
+      if (!gate.isCentroUnlocked()) renderCentroGate();
+      else viewCentroMaestro();
+      break;
+    case 'privado': viewPrivado(r.param); break;
+    default: viewHome();
+  }
+  currentRenderedRoute = routePath(r);
+  renderRail(r);
+}
+
+function restoreRenderedHash(path) {
+  const hash = '#' + (path || '/');
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${hash}`);
+}
+
+async function protectHistoryNavigation() {
+  if (historyNavigationPending) return;
+  historyNavigationPending = true;
+  const frame = $('#mFrame');
+  const mountedRoute = currentRenderedRoute || frame?.dataset.renderedRoute || '/';
+  try {
+    await resolveHistoryNavigation({
+      checkpoint: checkpointActiveModule,
+      mountedRoute,
+      getLatestRoute: router.current,
+      routePath,
+      renderRoute,
+      restoreRoute: restoreRenderedHash,
+      onFailure: () => toast(MODULE_CHECKPOINT_ERROR),
+    });
+    pendingHistoryRoute = null;
+  } finally {
+    historyNavigationPending = false;
+  }
+}
+
+function route(r) {
+  const requestedRoute = routePath(r);
+  if (requestedRoute === currentRenderedRoute) return;
+
+  const frame = $('#mFrame');
+  if (!frame) {
+    if (approvedModuleRoute === requestedRoute) approvedModuleRoute = '';
+    renderRoute(r);
+    return;
+  }
+
+  if (approvedModuleRoute === requestedRoute) {
+    approvedModuleRoute = '';
+    renderRoute(r);
+    return;
+  }
+
+  approvedModuleRoute = '';
+  pendingHistoryRoute = r;
+  void protectHistoryNavigation();
+}
+
+/* ---------------- Service Worker ---------------- */
+function registerSW() {
+  const start = () => installUpdateControl({ version: APP_VERSION, checkpoint: async (reason, update) => {
+    if (moduleNavigationPending || historyNavigationPending) return {ok:false};
+    return checkpointActiveModule(reason, update);
+  }}).catch(error => console.warn('Actualización PWA pendiente:', error));
+  if (document.readyState === 'complete') void start();
+  else window.addEventListener('load', start, {once:true});
+}
+
+/* ---------------- Arranque ---------------- */
+function boot() {
+  // Only an unambiguous pending checkpoint for this installed version can recover a cold-start route.
+  if(!location.hash||location.hash==='#/'||location.hash==='#'){
+    const pending=contextStore(sessionStorage,localStorage,APP_VERSION).pending();
+    if(pending.length===1)history.replaceState(null,'',pending[0].record.route);
+  }
+  renderHeader();
+  router.onChange(route);
+  registerSW();
+  router.start();
+  prepareProduccionDataIfNewer();
+}
+boot();
