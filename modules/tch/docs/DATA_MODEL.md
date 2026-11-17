@@ -1,0 +1,47 @@
+# DATA MODEL
+
+## Suerte
+Campos centrales:
+`id`, `legacyId`, `farmCode`, `producer`, `lot`, `area`, `variety`, `rowSpacingM`,
+`plantingDate`, `lastCutDate`, `zone`, `tenureCode`, `tenureLabel`, `irrigation`,
+`historicalTch`, `latestSeasonTch`, `estimatedTch2627`, `estimatedTch2627UpdatedAt`, `estimatedTch2627Source`,
+`estimatedTons2627`, `irrigationCount`, `masterStatus`, `masterObservation`.
+
+## Biometría
+Además de identificación de suerte:
+`currentAgeMonths`, `targetAgeMonths`, `adjustmentPct`, `biometricTch`, `projectedTch`,
+`projectedTons`, `weightTch`, `weightPointCount`, `cvPct`, `quality`, `validation`, `samples`.
+
+Durante la captura, `activeBiometryId` conserva la identidad persistida de la sesión abierta. El
+primer guardado crea el ID y los guardados posteriores reemplazan ese mismo registro, preservan
+`createdAt` y la hora original `time`, e incrementan `revision`; `updatedAt` identifica el último
+checkpoint. `editingBiometryId` se reserva para registros abiertos
+explícitamente desde el Historial. Iniciar una nueva biometría limpia ambas identidades.
+
+## Borrador de biometría v1
+
+El store `settings` conserva, bajo la clave independiente `draft:biometry:v1`, un único objeto
+`{ version, updatedAt, lotId, activeBiometryId, editingBiometryId, biometry }`. `biometry`
+incluye la sesión capturada completa (fecha, técnico, parámetros, fase, puntos, punto activo y
+validación), pero nunca una copia del Maestro General ni campos oficiales como `id`, `revision`,
+`createdAt` o `time`. El borrador no escribe en `biometries`; un guardado oficial lo elimina.
+
+## Punto v2.4
+`pointCode`, `sampleLengthM`, `stalkCount` o `directStalksPerMeter`,
+`heightM`, `diameterMm`, `rowSpacingM`, `tch`,
+`weighingEnabled`, `weighedStalkCount`, `weighedTotalKg`, `averageStalkWeightKg`, `weightTch`,
+GPS y observaciones.
+
+Campos legacy `lengthCm` y `diameterCm` se conservan en registros guardados para compatibilidad.
+
+## Visita de campo v2.7.2
+
+`id`, `date`, `time`, `technician`, identificación completa de suerte, `purpose`,
+`overallCondition`, `waterStatus`, `weedLevel`, `pestLevel`, `lodgingPct`,
+`tchSource`, `estimatedTch`, `tchDescription`, `linkedBiometryId`, `estimatedTch2627`,
+`lodgingDescription`, GPS, `notes`, `photos`, `datasetVersion`, `revision`, `updatedAt`, `sync`.
+
+Cada fotografía nueva contiene `id`, `blob` JPEG optimizado, dimensiones, tamaño,
+nombre original y fecha de captura. La copia rotulada no se guarda: se genera como PNG al exportar.
+La visita exige al menos una fotografía, pero permite agregar todas las necesarias según el espacio disponible del dispositivo.
+Las fotografías antiguas con `dataUrl` siguen siendo válidas y se convierten al exportar o respaldar.
