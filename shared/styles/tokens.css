@@ -1,0 +1,120 @@
+/* ============================================================
+   tokens.css — Sistema de diseño "Negocios de Caña CASUR"
+   Identidad: azul petróleo · pizarra · gris · blanco.
+   Tema claro por defecto; el cromo (barra lateral y barra de
+   módulo) usa petróleo oscuro. Tipografía Inter servida local
+   (offline-first). Editar aquí para re-tematizar toda la app.
+   ============================================================ */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("../assets/fonts/inter-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+:root {
+  /* --- Azul petróleo (marca, navegación, acción) --- */
+  --petrol-950: #0A1E25;
+  --petrol-900: #0F2A33;
+  --petrol-800: #143A46;
+  --petrol-700: #1B4D5C;
+  --petrol-600: #23647A;   /* acción principal */
+  --petrol-500: #2F7E97;
+  --petrol-300: #8DBCCB;
+  --petrol-100: #DCEBF0;
+  --petrol-50:  #EEF5F7;
+
+  /* --- Pizarra (texto y neutros) --- */
+  --slate-900: #1E293B;
+  --slate-700: #334155;
+  --slate-600: #475569;
+  --slate-500: #64748B;
+  --slate-400: #94A3B8;
+  --slate-300: #CBD5E1;
+  --slate-200: #E2E8F0;
+  --slate-100: #F1F5F9;
+  --slate-50:  #F6F8FA;
+  --white: #FFFFFF;
+
+  /* --- Estado (único uso de verde, ámbar y rojo) --- */
+  --ok: #2E7D5B;        --ok-soft: #E6F2EC;
+  --warn: #8A5A0B;      --warn-soft: #FBF1DC;
+  --err: #B42318;       --err-soft: #FBE9E7;
+  --offline: #64748B;
+
+  /* --- Roles semánticos --- */
+  --bg: var(--slate-50);
+  --surface: var(--white);
+  --surface-2: var(--slate-100);
+  --ink: var(--slate-900);
+  --ink-soft: var(--slate-600);
+  --ink-faint: var(--slate-500);
+  --hairline: var(--slate-200);
+  --hairline-strong: var(--slate-300);
+  --action: var(--petrol-600);
+  --action-hover: var(--petrol-700);
+  --focus: var(--petrol-500);
+
+  /* Cromo oscuro (barra lateral, barra de módulo) */
+  --chrome: var(--petrol-900);
+  --chrome-2: var(--petrol-800);
+  --chrome-ink: #F1F6F8;
+  --chrome-ink-soft: #A9C2CB;
+  --chrome-line: rgba(255, 255, 255, 0.10);
+  --chrome-active: rgba(255, 255, 255, 0.10);
+
+  /* --- Radios --- */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+
+  /* --- Sombras (planas; la jerarquía la da el borde) --- */
+  --shadow-card: 0 1px 2px rgba(15, 42, 51, 0.05);
+  --shadow-tile: 0 1px 2px rgba(15, 42, 51, 0.06);
+  --shadow-pop: 0 12px 32px rgba(15, 42, 51, 0.16), 0 2px 6px rgba(15, 42, 51, 0.08);
+
+  /* --- Tipografía --- */
+  --font-ui: "Inter", "Segoe UI", system-ui, -apple-system, Roboto,
+             "Helvetica Neue", Arial, sans-serif;
+  --font-num: var(--font-ui);
+
+  /* --- Escala de tipo --- */
+  --t-display: clamp(1.5rem, 3.2vw, 1.875rem);
+  --t-h2: 1.125rem;
+  --t-body: 0.9375rem;   /* 15 px */
+  --t-sm: 0.8125rem;     /* 13 px */
+  --t-xs: 0.75rem;       /* 12 px: mínimo permitido */
+
+  /* --- Espaciado --- */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-7: 32px; --sp-8: 40px;
+
+  /* --- Layout --- */
+  --header-h: 56px;
+  --nav-h: 60px;
+  --rail-w: 248px;
+  --rail-w-collapsed: 68px;
+  --content-max: 1120px;
+
+  /* --- Áreas seguras (notch / gestos) --- */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Acento por módulo: un solo color de acción en toda la app.
+   Se conservan las variables para que el registro de módulos
+   siga funcionando sin cambios. */
+:root {
+  --accent-produccion: var(--petrol-600);
+  --accent-tch: var(--petrol-600);
+  --accent-riego: var(--petrol-600);
+  --accent-insumos: var(--petrol-600);
+  --accent-inventario: var(--petrol-600);
+  --accent-labores: var(--petrol-600);
+  --accent-admin: var(--slate-600);
+  --accent-private: var(--err);
+}
