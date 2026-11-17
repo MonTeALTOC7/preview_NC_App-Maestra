@@ -1,0 +1,1 @@
+window.CASUR_RELEASE={"version":"2026.10.25-aforo.1101","source":"Estimados_para_APP_Z2627.xlsx","sheet":"Estimados_2627","publishedAt":null,"generated":"2026-10-12","tchEst2627EffectiveDate":"2026-10-12","sourceSha256":"aa9ab25b863dc399d5a6d445c0efe7907ca8956ef868429f308a404a46267fc6","cronologicoRows":1053,"historicoRows":11598};

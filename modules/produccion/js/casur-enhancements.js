@@ -1,0 +1,1992 @@
+(function () {
+  "use strict";
+
+  const ESTIMATE_DATE = "2026-07-17";
+  const PASSWORD_HASH = "6315700c5446173c02844f5fcc514d3b52e8da0ad4b31f6126049d2d8709ad34";
+  const UNLOCK_MINUTES = 30;
+  const historicalEngine = window.CASUR_HISTORICAL_ENGINE;
+  // User-approved decisions for these exact source snapshots and season only.
+  // 849e...: saved Aforos snapshot, Cronologico rows reconciled to the extraction
+  // audit (1,046 rows, zero value differences); see docs/CONSULTA_ESTIMADOS_PLAN_B2.md.
+  // Expected identity/area/classification/TCH checks below remain mandatory.
+  // aa9a...: restored extraction, audited separately (BP/BQ renamed; BT/BV
+  // auxiliary values changed). A matching file name never grants trust.
+  const decisionSources = ['82cd45c03b8c80ddda6ebc6078289df4f63b6a380403da6f103f2a52fa30e069',
+    '716d374c63aa0e990f18cbabee9f391eee3d54d50fd8395488a8357e5bbcbbae',
+    '849e3bac1fa0ff6abd49c690f25ab0910b18282674ddea833283c79d6d46fc04',
+    'aa9ab25b863dc399d5a6d445c0efe7907ca8956ef868429f308a404a46267fc6'];
+  window.CASUR_OPERATIONAL_DECISIONS = Object.freeze([
+    { id:'CASUR-2026-10-25-2003',key:'2003',season:'26/27',destination:'Semilla',approvedAt:'2026-10-25',
+      reason:'Decisión expresa del usuario CASUR: Semilla activa, fuera de molienda.',sourceHashes:decisionSources,
+      expectedSource:{classification:'Molienda',destination:'Semilla',area:10.95,tch:0} },
+    { id:'CASUR-2026-10-25-1927',key:'1927',season:'26/27',destination:'Molienda',approvedAt:'2026-10-25',
+      reason:'Decisión expresa del usuario CASUR: Molienda activa; discrepancia original conservada.',sourceHashes:decisionSources,
+      expectedSource:{classification:'Molienda',destination:'Semilla',area:6.15,tch:70} },
+  ]);
+  const $ = (id) => document.getElementById(id);
+  const nf = new Intl.NumberFormat("es-NI", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const nf0 = new Intl.NumberFormat("es-NI", { maximumFractionDigits: 0 });
+  const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
+  }[char]));
+  const text = (value) => String(value ?? "").trim();
+  const normal = (value) => text(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const finite = (value) => {
+    if (value === null || value === undefined || text(value) === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  const round = (value, digits = 2) => {
+    const number = finite(value);
+    if (number === null) return null;
+    const factor = 10 ** digits;
+    return Math.round(number * factor) / factor;
+  };
+  const fmt = (value, suffix = "") => finite(value) === null ? "—" : `${nf.format(Number(value))}${suffix}`;
+  const formatDate = (value) => {
+    if (!value) return "—";
+    const parts = String(value).slice(0, 10).split("-");
+    return parts.length === 3 ? `${parts[2]}/${parts[1]}/${parts[0]}` : String(value);
+  };
+  const weighted = (rows, field) => {
+    let numerator = 0;
+    let denominator = 0;
+    (rows || []).forEach((row) => {
+      const area = finite(row.area);
+      const value = finite(row[field]);
+      if (area > 0 && value !== null) { numerator += area * value; denominator += area; }
+    });
+    return denominator ? round(numerator / denominator) : null;
+  };
+  const dominant = (rows, field) => {
+    const totals = new Map();
+    (rows || []).forEach((row) => {
+      const key = text(row[field]) || "Sin dato";
+      totals.set(key, (totals.get(key) || 0) + (finite(row.area) || 0));
+    });
+    return [...totals].sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
+  };
+  // Audited snapshots authorized by CASUR; changing a file name cannot grant trust.
+  const aforoSources = decisionSources;
+  function forecastForRow(record, season = window.CRONO_DATA?.meta?.estimateSeason || '26/27') {
+    const source = record?.forecast?.source || record?.source;
+    const authorized = record?.sourcePresence === 'present' && record?.dataVersion && season === '26/27' &&
+      record.forecast?.season === season && aforoSources.includes(source?.sha256) && record.source?.sha256 === source?.sha256;
+    if (!authorized) return { state: 'not-applied', tch: null, tons: null, usable: false,
+      reason: 'Aforo autorizado no cargado/aplicado', season, source: null };
+    const p = window.CASUR_OPERATIONAL_IMPORT.participation(record);
+    const value = finite(record.forecast.tch);
+    const tch = value !== null && value >= 0 ? value : null;
+    return { state: tch === null ? 'missing' : tch === 0 ? 'zero' : 'available', tch,
+      tons: p.milling && tch !== null ? p.millingArea * tch : null, usable: p.usable && tch !== null,
+      reason: tch === null ? 'Sin estimado en la fuente' : tch === 0 ? 'Estimado cero en la fuente' : 'Aforo autorizado',
+      participation: p, season, source };
+  }
+  function formatCronoDate(value) {
+    const iso = window.CASUR_OPERATIONAL_IMPORT.dateValue(value).iso;
+    if (!iso) return '—';
+    const [year, month, day] = iso.split('-');
+    return `${day}-${['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'][Number(month)-1]}-${year}`;
+  }
+  function cutTypeText(value) {
+    const original = text(value), key = normal(original);
+    return !original ? 'Tipo de corte N/D' : key === 'manual' ? 'Manual' : key === 'cortemecanico' ? 'Corte mecánico' : `${original} · requiere interpretación`;
+  }
+  function referenceDate(record) {
+    const plan = record?.plan, source = record?.source, provenance = record?.provenance?.proposedDate;
+    const date = window.CASUR_OPERATIONAL_IMPORT.dateValue(plan?.date?.iso).iso;
+    const authorized = forecastForRow(record).state !== 'not-applied' &&
+      window.CASUR_OPERATIONAL_IMPORT.aliases.proposedDate.some(header => normal(header) === normal(provenance?.header));
+    const base = { label: 'Fecha para cosecha', type: 'proposed', source: source || null,
+      season: record?.forecast?.season || null, dataVersion: record?.dataVersion || null,
+      provenance: provenance || null, cutProvenance: record?.provenance?.proposedCut || null };
+    if (!authorized || !date) return { ...base, date: null, type: 'missing',
+      detail: authorized ? 'Sin fecha propuesta válida en la fuente' : 'Generación autorizada no cargada/aplicada' };
+    // A proposal stays a proposal even when its date has passed. Never infer execution.
+    return { ...base, date, cutType: text(plan.cut) || null, detail: cutTypeText(plan.cut) };
+  }
+  function dateSummary(rows) {
+    const dates = (rows || []).map(r => referenceDate(r));
+    const found = dates.filter(d => d.date), same = found.length && new Set(found.map(d => d.date)).size === 1;
+    if (dates.length === 1) return { ...dates[0], display: dates[0].date ? formatCronoDate(dates[0].date) : 'N/D' };
+    return { label: 'Fecha para cosecha', type: 'scope', date: same && found.length === dates.length ? found[0].date : null,
+      display: !found.length ? 'N/D' : same && found.length === dates.length ? formatCronoDate(found[0].date) : 'Varias fechas',
+      detail: found.length ? `${found.length}/${dates.length} suertes con propuesta · detalle por suerte` : 'Sin fechas propuestas válidas', dates };
+  }
+  const estimateSummary = (rows) => {
+    const all = rows || [];
+    const operational = all.some((row) => row.sourcePresence === 'present' || row.sourcePresence === 'absent');
+    const season = operational ? all.find((row) => row.sourcePresence === 'present' && row.forecast?.season)?.forecast.season : '26/27';
+    if (operational) {
+      const totals = window.CASUR_OPERATIONAL_IMPORT.totals(all);
+      const oneGeneration = new Set(all.filter(r => r.sourcePresence === 'present').map(r => r.dataVersion)).size === 1;
+      const covered = oneGeneration ? all.map(r => ({ r, f: forecastForRow(r, season) })).filter(({ f }) => f.usable) : [];
+      const validArea = covered.reduce((sum, { f }) => sum + f.participation.millingArea, 0);
+      const validTons = covered.reduce((sum, { f }) => sum + f.tons, 0);
+      const tch = validArea ? round(validTons / validArea) : null;
+      const tons = covered.length ? round(validTons) : null;
+      return { estimateSeason: season || null, estimateTch: tch, estimateTons: tons,
+        estimateArea: round(validArea), estimateLots: covered.length,
+        tchEst2627: season === '26/27' ? tch : null, tonEst2627: season === '26/27' ? tons : null,
+        areaEstimado2627: season === '26/27' ? round(validArea) : 0,
+        suertesEstimado2627: season === '26/27' ? covered.length : 0,
+        estimateState: oneGeneration && all.some(r => forecastForRow(r, season).state !== 'not-applied') ? 'applied' : 'not-applied',
+        coberturaEstimadoAreaPct: totals.millingArea ? round(validArea / totals.millingArea * 100) : null,
+        coberturaEstimadoSuertesPct: totals.milling ? round(covered.length / totals.milling * 100) : null,
+        inventoryArea: round(totals.inventoryArea), activeLots: totals.active, seedLots: totals.seed, seedArea:round(totals.seedArea),
+        millingArea: round(totals.millingArea), millingLots: totals.milling, catalogLots: totals.catalog,
+        pendingMillingArea: round(totals.millingArea - validArea), pendingMillingLots: totals.milling - covered.length,
+        inactiveLots: totals.inactive, absentLots: totals.absent, conflictLots: totals.conflicts };
+    }
+    return { estimateSeason: '26/27', estimateState: 'not-applied', estimateTch: null, estimateTons: null,
+      estimateArea: 0, estimateLots: 0, tchEst2627: null, tonEst2627: null, areaEstimado2627: 0,
+      suertesEstimado2627: 0, coberturaEstimadoAreaPct: null, coberturaEstimadoSuertesPct: null };
+  };
+  const groupRows = (rows, field) => {
+    const groups = new Map();
+    (rows || []).forEach((row) => {
+      const key = text(row[field]) || "Sin dato";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    });
+    return [...groups].map(([key, values]) => ({
+      key,
+      area: round(values.reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+      suertes: values.length,
+      tch: weighted(values, "tch"),
+      ...estimateSummary(values),
+    })).sort((a, b) => b.area - a.area);
+  };
+
+  function allCronoRecords(data = window.CRONO_DATA) {
+    return (data?.producers || []).flatMap((producer) => (producer.details || []).map((row) => ({
+      ...row, code: text(row.code || producer.code), name: text(row.name || producer.name),
+    })));
+  }
+
+  function buildCronoData(records, source = "Edición manual interna") {
+    records = records.map((original) => {
+      const r = original.sourcePresence ? window.CASUR_OPERATIONAL_IMPORT.applyDecisions(original, window.CASUR_OPERATIONAL_DECISIONS) : original;
+      if (!r.sourcePresence) return r;
+      const p = window.CASUR_OPERATIONAL_IMPORT.participation(r);
+      return { ...r, area: p.activeArea, millingArea: p.millingArea,
+        participatesCurrentArea: p.active, participatesMilling: p.milling, millingEstimatedTons: p.estimatedTons };
+    });
+    const farms = new Map();
+    records.forEach((record) => {
+      const key = text(record.code) || text(record.name) || "SIN_CODIGO";
+      if (!farms.has(key)) farms.set(key, { code: text(record.code), name: text(record.name) || "Sin nombre", details: [] });
+      farms.get(key).details.push(record);
+    });
+    const producers = [...farms.values()].map((farm) => {
+      const rows = farm.details;
+      const summary = {
+        code: farm.code, name: farm.name, zone: dominant(rows, "zona"), tenencia: dominant(rows, "tenencia"),
+        destino: dominant(rows, "destino"), tipoCultivo: dominant(rows, "tipoCultivo"),
+        area: round(rows.reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+        tch: weighted(rows, "tch"), suertes: rows.length,
+        areaBajoTch: 0, areaMedioTch: 0, areaAltoTch: 0, areaSecano: 0, areaRiego: 0,
+        areaSinDatoRiego: 0, suertesCriticas: 0,
+        riegoDom: dominant(rows, "tipoRiego"), variedadDom: dominant(rows, "variedad"), texturaDom: dominant(rows, "textura"),
+        ...estimateSummary(rows), details: rows,
+      };
+      rows.forEach((row) => {
+        const area = finite(row.area) || 0;
+        const tch = finite(row.tch);
+        if (area > 0 && tch !== null && tch > 0 && tch < 60) { summary.areaBajoTch += area; summary.suertesCriticas += 1; }
+        else if (tch !== null && tch < 70) summary.areaMedioTch += area;
+        else if (tch !== null) summary.areaAltoTch += area;
+        const irrigation = normal(row.tipoRiego);
+        if (!irrigation) summary.areaSinDatoRiego += area;
+        else if (irrigation.includes("secano")) summary.areaSecano += area;
+        else summary.areaRiego += area;
+      });
+      ["areaBajoTch", "areaMedioTch", "areaAltoTch", "areaSecano", "areaRiego", "areaSinDatoRiego"]
+        .forEach((key) => { summary[key] = round(summary[key]) || 0; });
+      return summary;
+    }).sort((a, b) => a.name.localeCompare(b.name, "es"));
+    const rows = producers.flatMap((producer) => producer.details);
+    const totalArea = round(rows.reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0;
+    const global = {
+      area: totalArea, tch: weighted(rows, "tch"), suertes: rows.length, productores: producers.length,
+      areaBajoTch: round(rows.filter((row) => finite(row.tch) > 0 && finite(row.tch) < 60).reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+      areaMedioTch: round(rows.filter((row) => finite(row.tch) >= 60 && finite(row.tch) < 70).reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+      areaAltoTch: round(rows.filter((row) => finite(row.tch) >= 70).reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+      areaSecano: round(rows.filter((row) => normal(row.tipoRiego).includes("secano")).reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+      areaRiego: round(rows.filter((row) => text(row.tipoRiego) && !normal(row.tipoRiego).includes("secano")).reduce((sum, row) => sum + (finite(row.area) || 0), 0)) || 0,
+      ...estimateSummary(rows),
+    };
+    const priorMeta = window.CRONO_DATA?.meta || {};
+    return {
+      meta: { ...priorMeta, publishedAt: null, importedAt: new Date().toISOString(), source, rows: rows.length, rawRows: rows.length, productores: producers.length,
+        generated: null, tchEst2627EffectiveDate: ESTIMATE_DATE, manualChanges: true },
+      global,
+      options: producers.map((producer) => ({ code: producer.code, name: producer.name, zone: producer.zone,
+        area: producer.area, tch: producer.tch, tchEst2627: producer.tchEst2627,
+        estimateTch: producer.estimateTch, estimateTons: producer.estimateTons, label: `${producer.code} · ${producer.name}` })),
+      producers,
+      groups: { zona: groupRows(rows, "zona"), riego: groupRows(rows, "tipoRiego"), tenencia: groupRows(rows, "tenencia"),
+        tipoCultivo: groupRows(rows, "tipoCultivo"), destino: groupRows(rows, "destino"), variedad: groupRows(rows, "variedad"),
+        textura: groupRows(rows, "textura"), estado: groupRows(rows, "estado") },
+    };
+  }
+
+  function replaceObject(target, source) {
+    Object.keys(target || {}).forEach((key) => { delete target[key]; });
+    Object.assign(target, source);
+  }
+
+  function applyCronoData(data, message) {
+    if (!window.CRONO_DATA) window.CRONO_DATA = {};
+    replaceObject(window.CRONO_DATA, data);
+    document.dispatchEvent(new CustomEvent('casur-crono-effective-change'));
+    window.__CRONO_ZONE_ROWS = null;
+    window.CASUR_ADMIN_DATA = window.CRONO_DATA;
+    refreshCronoEditorOptions();
+    if (typeof window.renderCronoHome === "function") window.renderCronoHome();
+    addLog(message || "Cronológico actualizado en memoria.");
+  }
+
+  function currentCronoScope() {
+    const data = window.CRONO_DATA || {};
+    const selectValue = text($("cronoProducerSelect")?.value);
+    const query = text($("cronoQ")?.value);
+    const code = selectValue || query.split(" · ")[0];
+    const producer = (data.producers || []).find((item) => text(item.code) === code);
+    if (!producer) return { rows: allCronoRecords(data), summary: { ...data.global, ...estimateSummary(allCronoRecords(data)) }, producer: null };
+    const table = $("cronoContent")?.querySelector("table");
+    if (table && table.tBodies[0]?.rows.length === 1) {
+      const lotCode = text(table.tBodies[0].rows[0].cells[0]?.querySelector("b")?.textContent);
+      const found = (producer.details || []).filter((row) => [text(row.codLote), `${producer.code}${row.suerte}`].includes(lotCode));
+      if (found.length) return { rows: found, summary: estimateSummary(found), producer };
+    }
+    return { rows: producer.details || [], summary: { ...producer, ...estimateSummary(producer.details || []) }, producer };
+  }
+
+  function estimateCoverageText(summary) {
+    if (summary.estimateState === 'not-applied') return 'Aforo autorizado no cargado/aplicado';
+    if (summary.millingLots === undefined) return 'Estimado oficial';
+    if (!summary.millingLots) return 'Sin participación en molienda';
+    return `${summary.estimateLots}/${summary.millingLots} molienda · ${fmt(summary.coberturaEstimadoAreaPct, '% área')}` +
+      (summary.pendingMillingLots ? ` · Pendiente ${fmt(summary.pendingMillingArea, ' ha')}` : '');
+  }
+
+  function refreshOperationalView(data) {
+    if (data?.meta?.operationalContract !== 1) return data;
+    const derived = buildCronoData(allCronoRecords(data), data.meta.source);
+    // Recompute the presentation of saved generations without rewriting their IDB snapshots.
+    return { ...data, ...derived, meta: { ...data.meta }, operational: { ...data.operational,
+      totals: window.CASUR_OPERATIONAL_IMPORT.totals(derived.producers.flatMap(p => p.details)) } };
+  }
+
+  function estimateKpi(label, value, sub) {
+    return `<div class="kpi casur-estimate-kpi" data-casur-estimate="1"><span class="label">${esc(label)}</span><strong>${value}</strong><em>${esc(sub)}</em></div>`;
+  }
+  function estimatedTonsKpi(rows, season) {
+    const audit = estimateSummary(rows);
+    const label = `Ton. Estim. Z${season || '—'}`;
+    const detail = estimateCoverageText(audit);
+    return `<div class="kpi casur-tons-kpi" data-crono-tons="${esc(JSON.stringify(audit))}" tabindex="0" title="${esc(detail)}" aria-label="${esc(label)}: ${audit.estimateTons === null ? 'N/D' : fmt(audit.estimateTons,' t')}. ${esc(detail)}"><span class="label">${esc(label)}</span><strong>${audit.estimateTons === null ? 'N/D' : fmt(audit.estimateTons,' t')}</strong></div>`;
+  }
+  function estimateCaption(reason, sourceDate) {
+    const date = window.CASUR_OPERATIONAL_IMPORT.dateValue(sourceDate).iso;
+    return (reason === 'Aforo autorizado' ? 'Último Aforo' : reason) + (date ? `\n${formatCronoDate(date)}` : '');
+  }
+  // Presentation audit only: reuse the individual view's current-age function.
+  // A partial mean is not presented as the age of the whole active inventory.
+  function currentAgeSummary(rows, ageForRow) {
+    let activeArea = 0, validArea = 0, numerator = 0, activeLots = 0, validLots = 0;
+    for (const row of rows || []) {
+      const area = row.sourcePresence
+        ? window.CASUR_OPERATIONAL_IMPORT.participation(row).activeArea : finite(row.area);
+      if (!(area > 0)) continue;
+      activeArea += area; activeLots++;
+      // Renewal without a planting date is a status, not an observed age of zero.
+      const age = row.renovacion && !row.fSiembra ? null : finite(ageForRow(row));
+      if (age === null || age < 0) continue;
+      validArea += area; numerator += area * age; validLots++;
+    }
+    const complete = activeArea > 0 && Math.abs(activeArea - validArea) < 1e-7;
+    return { months: complete ? numerator / validArea : null, numerator, validArea, activeArea,
+      coveragePct: activeArea > 0 ? 100 * validArea / activeArea : null, activeLots, validLots,
+      reason: !activeArea ? 'Sin área activa' : !complete ? 'Cobertura de edad incompleta' : null };
+  }
+  function currentAgeKpi(rows, ageForRow) {
+    const audit = currentAgeSummary(rows, ageForRow);
+    const detail = `Área con edad válida: ${fmt(audit.validArea)} / ${fmt(audit.activeArea)} ha · Cobertura: ${fmt(audit.coveragePct, '%')}` +
+      (audit.reason ? ` · ${audit.reason}` : '');
+    return `<div class="kpi crono-kpi-technical" data-crono-current-age="${esc(JSON.stringify(audit))}" tabindex="0" title="${esc(detail)}" aria-label="Edad ponderada actual: ${audit.months === null ? 'N/D' : fmt(audit.months, ' meses')}. ${esc(detail)}"><span class="label">Edad ponderada actual</span><strong>${audit.months === null ? 'N/D' : fmt(audit.months, ' meses')}</strong></div>`;
+  }
+  function activeAreaForRow(row) {
+    return row.sourcePresence ? window.CASUR_OPERATIONAL_IMPORT.participation(row).activeArea : finite(row.area);
+  }
+  function cropStage(row) {
+    const cut = finite(row.corte), origin = row.provenance?.cut;
+    const verified = window.CASUR_OPERATIONAL_IMPORT.aliases.cut.some(header => normal(header) === normal(origin?.header)) &&
+      finite(origin?.raw) === cut;
+    if (!verified || !Number.isInteger(cut) || cut <= 0) return 'Sin clasificar';
+    return cut === 1 ? 'Plantilla' : cut === 2 ? '2.º corte' : cut <= 4 ? 'Cortes 3–4' : cut <= 6 ? 'Cortes 5–6' : 'Cortes 7+';
+  }
+  function orderAgronomicGroups(groups, metric = 'area') {
+    return groups.slice().sort((a,b) => {
+      const x = finite(a[metric]), y = finite(b[metric]);
+      return (x === null) - (y === null) || (y ?? 0) - (x ?? 0) || a.key.localeCompare(b.key,'es');
+    });
+  }
+  function agronomicGroups(rows, field) {
+    const groups = new Map(), applied = estimateSummary(rows).estimateState === 'applied';
+    for (const row of rows || []) {
+      const area = activeAreaForRow(row);
+      if (!(area > 0)) continue;
+      const key = field === 'stage' ? cropStage(row) : text(row[field]) || 'Sin clasificar';
+      if (!groups.has(key)) groups.set(key, {key, area:0, rows:[]});
+      const group = groups.get(key); group.area += area; group.rows.push(row);
+    }
+    return orderAgronomicGroups([...groups.values()].map(({key, area, rows: members}) => {
+      const estimate = estimateSummary(members);
+      return {key, area, lots:members.length, estimateLots:estimate.estimateLots,
+        estimateTch:applied ? estimate.estimateTch : null,
+        estimateTons:applied ? estimate.estimateTons : null, estimateArea:applied ? estimate.estimateArea : 0,
+        millingArea:estimate.millingArea || 0, coveragePct:applied ? estimate.coberturaEstimadoAreaPct : null};
+    }));
+  }
+  function areaPanel(rows, field, title, chart) {
+    const groups = agronomicGroups(rows, field), total = groups.reduce((sum, group) => sum + group.area, 0);
+    return `<div class="crono-box" data-crono-area-group="${esc(field)}" data-area-total="${total}"><h3>${esc(title)}</h3>${chart(groups)}<div class="crono-area-total" role="group" aria-label="Total de ${esc(title.toLowerCase())}"><strong>${fmt(total,' ha')}</strong></div></div>`;
+  }
+  function estimatedTchPanel(rows, field, title) {
+    const groups = orderAgronomicGroups(agronomicGroups(rows, field),'estimateTch'), max = Math.max(1, ...groups.map(g => g.estimateTch || 0));
+    return `<div class="crono-box crono-estimate-analysis" data-crono-estimate-group="${esc(field)}" data-group-audit="${esc(JSON.stringify(groups))}"><h3>${esc(title)}</h3>` +
+      (!groups.length ? '<div class="empty">Sin datos.</div>' : '<div class="hchart">' + groups.map(g => {
+        const detail = `Molienda: ${fmt(g.estimateTons,' t')} / ${fmt(g.estimateArea,' ha válidas')} · Cobertura: ${fmt(g.coveragePct,'%')}`;
+        return `<div class="hrow" tabindex="0" title="${esc(detail)}" aria-label="${esc(g.key)}: ${g.estimateTch === null ? 'N/D' : fmt(g.estimateTch)+' TCH'}. ${esc(detail)}"><div class="hlabel">${esc(g.key)}</div><div class="htrack"><div class="hfill" style="width:${g.estimateTch === null ? 0 : Math.max(4,g.estimateTch/max*100)}%"></div></div><div class="hval">${g.estimateTch === null ? 'N/D' : fmt(g.estimateTch)}</div></div>`;
+      }).join('')+'</div>')+'</div>';
+  }
+  function detailColumns(season) {
+    return ['Suerte','Área','# de Corte','Fecha corte/siembra','Destino Cultivo','Textura','Tipo de riego',
+      'Surco','Distancia (km)','Zona','Variedad','TCH',`TCH est. ${season}`,`Ton. est. ${season}`,
+      'Tenencia','Estado TCH 25/26','Estado maestro','Observación'];
+  }
+  function reorderCronoDetail(table, records, season) {
+    const header = table.tHead.rows[0], original = [...header.cells];
+    const index = new Map(original.map((cell, i) => [normal(cell.textContent), i]));
+    if (!index.has(normal('# de Corte'))) index.set(normal('# de Corte'), index.get(normal('Corte')));
+    const columns = detailColumns(season).map(label => ({ label, index: index.get(normal(label)) }));
+    // This is the existing chronological detail, never a generic or multiple-selection table.
+    if (columns.some(column => column.index === undefined && !['Tenencia','Destino Cultivo'].includes(column.label))) return;
+    const headers = columns.map(column => {
+      const cell = original[column.index] || document.createElement('th');
+      cell.textContent = column.label; return cell;
+    });
+    [...table.tBodies[0].rows].forEach((row, i) => {
+      const cells = [...row.cells], id = text(cells[0]?.querySelector('b')?.textContent);
+      const record = records.find(r => text(r.codLote || `${r.code}${r.suerte}`) === id) || records[i];
+      const ordered = columns.map(column => {
+        const cell = cells[column.index] || document.createElement('td');
+        if (column.label === 'Tenencia') {
+          const value = text(record?.tenencia);
+          cell.textContent = ({ CV:'Compra Venta', CA:'Arriendo', PR:'Propio' })[value.toUpperCase()] || value || '—';
+        }
+        if (column.label === 'Destino Cultivo' && column.index === undefined) cell.textContent = text(record?.destino) || '—';
+        return cell;
+      });
+      row.replaceChildren(...ordered);
+    });
+    header.replaceChildren(...headers);
+  }
+  function dateKpi(rows) {
+    const d = dateSummary(rows);
+    const caption = rows.length > 1 ? (d.dates?.some(date => date.date) ? 'Detalle por suerte' : '') : d.detail;
+    return `<div class="kpi casur-proposal-kpi" data-crono-date="${esc(d.type)}" data-date-metadata="${esc(JSON.stringify(d))}"><span class="label">${esc(d.label)}</span><strong>${esc(d.display)}</strong><em>${esc(caption)}</em></div>`;
+  }
+
+  let enhancing = false;
+  function enhanceCronoView() {
+    if (enhancing) return;
+    const content = $("cronoContent");
+    if (!content || !content.dataset.ready) return;
+    enhancing = true;
+    try {
+      const scope = currentCronoScope();
+      const summary = scope.summary || estimateSummary(scope.rows);
+      const operational = window.CRONO_DATA?.meta?.operationalContract === 1;
+      const season = operational ? (window.CRONO_DATA.meta.estimateSeason || summary.estimateSeason || '—') : '26/27';
+      const individual = scope.rows.length === 1 ? forecastForRow(scope.rows[0], season) : null;
+      const estimateValue = individual ? individual.tch : summary.estimateTch;
+      const sourceLabel = individual ? individual.reason : estimateCoverageText(summary);
+      const aforoDate = individual?.source?.sourceDate ||
+        (operational && summary.estimateState === 'applied' ? window.CRONO_DATA.meta.tchEst2627EffectiveDate : null);
+      const kpis = content.querySelector(".kpis");
+      if (kpis && !kpis.querySelector("[data-casur-estimate]")) {
+        const estimate = finite(estimateValue);
+        const caption = scope.producer ? estimateCaption(operational && summary.estimateState === 'applied' ? 'Aforo autorizado' : sourceLabel, aforoDate) : '';
+        const card = estimateKpi(`TCH Estim. Z${season}`, estimate === null ? "N/D" : fmt(estimate), caption);
+        const before = scope.producer ? kpis.querySelector('[data-crono-date],[data-crono-tons]') : kpis.children[3];
+        if (before) before.insertAdjacentHTML("beforebegin", card);
+        else kpis.insertAdjacentHTML("beforeend", card);
+      }
+      const actions = content.querySelector(".ficha-actions");
+      actions?.querySelectorAll('.status-pill,.casur-estimate-badge').forEach(node => node.remove());
+      const detailTitle = content.querySelector('#cronoPrintPanel > .section-title > div');
+      if (operational && detailTitle && !detailTitle.dataset.participationScope) {
+        detailTitle.dataset.participationScope = '1';
+        const heading = detailTitle.querySelector('h3');
+        if (heading) heading.textContent = 'Detalle por suerte';
+      }
+      content.querySelectorAll("#cronoPrintPanel table").forEach((table) => {
+        if (table.dataset.casurEstimate === "1") return;
+        const header = table.tHead?.rows?.[0];
+        if (!header || header.cells.length < 3 || !normal(header.cells[2].textContent).includes("tch")) return;
+        const estHeader = document.createElement("th"); estHeader.textContent = `TCH est. ${season}`;
+        const tonHeader = document.createElement("th"); tonHeader.textContent = `Ton. est. ${season}`;
+        header.cells[2].after(tonHeader); header.cells[2].after(estHeader);
+        const oldState = [...header.cells].find((cell) => normal(cell.textContent) === "estado");
+        if (oldState) oldState.textContent = "Estado TCH 25/26";
+        const masterState = document.createElement("th"); masterState.textContent = "Estado maestro";
+        const noteHeader = document.createElement("th"); noteHeader.textContent = "Observación";
+        header.append(masterState, noteHeader);
+        [...(table.tBodies[0]?.rows || [])].forEach((row, index) => {
+          const lotCode = text(row.cells[0]?.querySelector("b")?.textContent);
+          const record = scope.rows.find((item) => [text(item.codLote), `${scope.producer?.code || item.code}${item.suerte}`].includes(lotCode)) || scope.rows[index];
+          const participation = operational && record ? window.CASUR_OPERATIONAL_IMPORT.participation(record) : null;
+          const forecast = forecastForRow(record, season), estimate = forecast.tch;
+          const estCell = document.createElement("td"); estCell.className = estimate === null ? "casur-no-estimate" : "casur-estimate-cell";
+          estCell.textContent = estimate === null ? "—" : fmt(estimate);
+          estCell.title = forecast.reason;
+          const tonCell = document.createElement("td"); tonCell.className = estimate === null ? "casur-no-estimate" : "casur-estimate-cell";
+          tonCell.textContent = forecast.tons === null ? "—" : fmt(forecast.tons, " t");
+          row.cells[2].after(tonCell); row.cells[2].after(estCell);
+          const stateCell = document.createElement("td"); stateCell.className = "casur-master-state";
+          stateCell.textContent = participation ? (participation.reason.startsWith(text(record.classification)) ? participation.reason : `${record.classification} · ${participation.reason}`) : text(record?.estado) || "—";
+          const noteCell = document.createElement("td"); noteCell.className = "casur-master-note"; noteCell.textContent = text(record?.observacion) || "—";
+          row.append(stateCell, noteCell);
+        });
+        reorderCronoDetail(table, scope.rows, season);
+        table.dataset.casurEstimate = "1";
+      });
+    } finally { enhancing = false; }
+  }
+
+  function installCronoObserver() {
+    const content = $("cronoContent");
+    if (!content) return;
+    new MutationObserver(() => queueMicrotask(enhanceCronoView)).observe(content, { childList: true, subtree: true });
+    enhanceCronoView();
+  }
+
+  function releaseStrip() {
+    const section = $("cronoSection")?.querySelector(".accordion-body");
+    if (!section || section.querySelector(".casur-release-strip")) return;
+    const release = window.CASUR_RELEASE || {};
+    section.insertAdjacentHTML("afterbegin", `<div class="casur-release-strip"><span><i class="casur-release-dot"></i><b id="casurReleaseKind">Datos compartidos</b> · versión <span id="casurReleaseVersion">${esc(release.version || "integrada")}</span></span><span class="casur-sync-pill" id="casurSyncPill">Actualización automática al abrir</span></div>`);
+    refreshReleaseStrip();
+  }
+  function refreshReleaseStrip() {
+    const local = window.CASUR_OPERATIONAL_LOCAL && window.CRONO_DATA?.meta?.operationalContract === 1;
+    const version = local ? window.CRONO_DATA.meta.dataVersion : window.CASUR_RELEASE?.version;
+    if ($("casurReleaseKind")) $("casurReleaseKind").textContent = local ? "Generación local aprobada" : "Datos compartidos";
+    if ($("casurReleaseVersion")) $("casurReleaseVersion").textContent = text(version) || "integrada";
+    if (local) updateSyncPill(`Generación local aprobada · ${text(version)}`, "");
+    else updateSyncPill(`Datos compartidos · versión ${text(version) || "integrada"}`, "");
+  }
+  if (typeof document.addEventListener === 'function') document.addEventListener('casur-crono-effective-change', refreshReleaseStrip);
+
+  async function sha256(value) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  function unlockValid() {
+    const stamp = Number(sessionStorage.getItem("casurAdminUnlockedAt"));
+    return Number.isFinite(stamp) && Date.now() - stamp < UNLOCK_MINUTES * 60 * 1000;
+  }
+  function touchUnlock() { if (unlockValid()) sessionStorage.setItem("casurAdminUnlockedAt", String(Date.now())); }
+  function updateAdminLauncher(unlocked = unlockValid(), expanded = false) {
+    const launcher = $("masterAdminLauncher");
+    const state = $("masterAdminLauncherState");
+    if (!launcher) return;
+    launcher.classList.toggle("is-locked", !unlocked);
+    launcher.classList.toggle("is-unlocked", unlocked);
+    launcher.setAttribute("aria-expanded", expanded ? "true" : "false");
+    launcher.setAttribute("aria-label", unlocked ? "Abrir Centro Maestro desbloqueado" : "Abrir módulo técnico protegido");
+    if (state) state.textContent = unlocked ? "Acceso desbloqueado" : "Acceso protegido";
+  }
+  function ensureLockDialog() {
+    if ($("casurLockLayer")) return;
+    document.body.insertAdjacentHTML("beforeend", `<div class="casur-lock-layer" id="casurLockLayer" hidden role="dialog" aria-modal="true" aria-labelledby="casurLockTitle"><div class="casur-lock-card"><div class="casur-lock-accent"></div><div class="casur-lock-body"><div class="casur-lock-icon">🔐</div><h2 id="casurLockTitle">Centro Maestro</h2><p>Acceso operativo para actualización, edición y publicación de datos.</p><form id="casurLockForm"><input id="casurLockPassword" type="password" inputmode="numeric" autocomplete="current-password" maxlength="12" aria-label="Contraseña"><div class="casur-lock-error" id="casurLockError"></div><div class="casur-lock-actions"><button class="casur-btn neutral" type="button" id="casurLockCancel">Cancelar</button><button class="casur-btn" type="submit">Desbloquear</button></div></form></div></div></div>`);
+    $("casurLockCancel").addEventListener("click", closeLock);
+    $("casurLockLayer").addEventListener("click", (event) => { if (event.target === $("casurLockLayer")) closeLock(); });
+    $("casurLockForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = $("casurLockPassword");
+      if (await sha256(input.value) !== PASSWORD_HASH) {
+        $("casurLockError").textContent = "Contraseña incorrecta.";
+        input.select();
+        return;
+      }
+      sessionStorage.setItem("casurAdminUnlockedAt", String(Date.now()));
+      updateAdminLauncher(true, false);
+      $("casurLockError").textContent = "";
+      closeLock();
+      openAdmin();
+    });
+  }
+  function closeLock() { const layer = $("casurLockLayer"); if (layer) layer.hidden = true; }
+  function requestAdminUnlock() {
+    ensureLockDialog();
+    $("casurLockLayer").hidden = false;
+    $("casurLockPassword").value = "";
+    setTimeout(() => $("casurLockPassword")?.focus(), 40);
+  }
+  function openAdmin(button) {
+    if (!unlockValid()) { updateAdminLauncher(false, false); requestAdminUnlock(); return; }
+    touchUnlock();
+    document.querySelectorAll(".navbtn").forEach((item) => item.classList.remove("active"));
+    if (button) button.classList.add("active");
+    const section = $("masterUpdateSection");
+    if (section) { section.classList.remove("is-locked"); section.open = true; updateAdminLauncher(true, true); section.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    if (typeof window.updateState === "function") window.updateState("Centro Maestro · Programador", "Actualización protegida");
+  }
+
+  let selectedCronoKey = "";
+  let selectedHistoryLot = null;
+  const changes = [];
+  function addLog(message) {
+    changes.unshift(`${new Date().toLocaleTimeString("es-NI", { hour: "2-digit", minute: "2-digit" })} · ${message}`);
+    const log = $("casurChangeLog");
+    if (log) log.innerHTML = changes.slice(0, 20).map((item) => `<div>${esc(item)}</div>`).join("");
+  }
+  function cronoKey(record) { return `${text(record.code)}||${text(record.suerte).toUpperCase()}`; }
+  function refreshCronoEditorOptions() {
+    const list = $("casurCronoOptions");
+    if (!list) return;
+    list.innerHTML = allCronoRecords().map((row) => `<option value="${esc(`${row.code} · ${row.suerte} · ${row.name}`)}"></option>`).join("");
+  }
+  function findCronoEditorRecord(value) {
+    const raw = text(value);
+    const [code, lot] = raw.split(" · ");
+    return allCronoRecords().find((row) => text(row.code) === text(code) && text(row.suerte).toUpperCase() === text(lot).toUpperCase()) ||
+      allCronoRecords().find((row) => cronoKey(row) === raw);
+  }
+  function setValue(id, value) { const element = $(id); if (element) element.value = value ?? ""; }
+  function loadCronoEditor() {
+    const record = findCronoEditorRecord($("casurCronoSearch")?.value);
+    if (!record) { alert("Seleccione una suerte válida de la lista."); return; }
+    selectedCronoKey = cronoKey(record);
+    setValue("editCode", record.code); setValue("editName", record.name); setValue("editLot", record.suerte);
+    setValue("editArea", record.area); setValue("editTch", record.tch); setValue("editTchEst", record.tchEst2627);
+    setValue("editTchDate", record.tchEst2627Fecha || ESTIMATE_DATE); setValue("editZone", record.zona);
+    setValue("editVariety", record.variedad); setValue("editCut", record.corte); setValue("editIrrigation", record.tipoRiego);
+    setValue("editState", record.estado); setValue("editObservation", record.observacion);
+  }
+  function newCronoEditor() {
+    selectedCronoKey = "";
+    ["casurCronoSearch", "editCode", "editName", "editLot", "editArea", "editTch", "editTchEst", "editZone", "editVariety", "editCut", "editIrrigation", "editState", "editObservation"].forEach((id) => setValue(id, ""));
+    setValue("editTchDate", ESTIMATE_DATE);
+  }
+  function saveCronoEditor() {
+    const records = allCronoRecords();
+    const code = text($("editCode")?.value); const name = text($("editName")?.value); const suerte = text($("editLot")?.value);
+    const area = finite($("editArea")?.value);
+    if (!code || !name || !suerte || !(area > 0)) { alert("Código, hacienda, suerte y área mayor que cero son obligatorios."); return; }
+    const nextKey = `${code}||${suerte.toUpperCase()}`;
+    const duplicate = records.find((row) => cronoKey(row) === nextKey && cronoKey(row) !== selectedCronoKey);
+    if (duplicate) { alert("Ya existe esa combinación de hacienda y suerte."); return; }
+    const estimate = finite($("editTchEst")?.value);
+    const record = records.find((row) => cronoKey(row) === selectedCronoKey) || {};
+    Object.assign(record, {
+      code, name, suerte, codLote: text(record.codLote) || `${code}${suerte}`, area: round(area), tch: round(finite($("editTch")?.value)),
+      tchEst2627: round(estimate), tonEst2627: estimate === null ? null : round(area * estimate),
+      tchEst2627Fecha: estimate === null ? null : (text($("editTchDate")?.value) || ESTIMATE_DATE),
+      tchEst2627Fuente: estimate === null ? null : "Edición manual Centro Maestro",
+      zona: text($("editZone")?.value) || "Sin zona", variedad: text($("editVariety")?.value) || "—",
+      corte: text($("editCut")?.value) || "—", tipoRiego: text($("editIrrigation")?.value) || "—",
+      estado: text($("editState")?.value) || "—", observacion: text($("editObservation")?.value),
+    });
+    if (!selectedCronoKey) records.push(record);
+    const wasExisting = Boolean(selectedCronoKey);
+    selectedCronoKey = nextKey;
+    applyCronoData(buildCronoData(records), `${wasExisting ? "Guardada" : "Agregada"} ${code}-${suerte}.`);
+    $("casurCronoSearch").value = `${code} · ${suerte} · ${name}`;
+  }
+  function deleteCronoEditor() {
+    if (!selectedCronoKey) { alert("Primero seleccione una suerte existente."); return; }
+    const records = allCronoRecords();
+    const record = records.find((row) => cronoKey(row) === selectedCronoKey);
+    if (!record || !confirm(`¿Eliminar ${record.code}-${record.suerte} del cronológico?`)) return;
+    applyCronoData(buildCronoData(records.filter((row) => cronoKey(row) !== selectedCronoKey)), `Eliminada ${record.code}-${record.suerte}.`);
+    newCronoEditor();
+  }
+
+  function historyLots() { return window.APP_DATA?.lotCompact || []; }
+  function refreshHistoryOptions() {
+    const list = $("casurHistoryOptions"); if (!list) return;
+    list.innerHTML = historyLots().map((lot) => `<option value="${esc(`${lot[0]} · ${lot[9]} · Suerte ${lot[10]}`)}"></option>`).join("");
+  }
+  function loadHistoryLot() {
+    const id = text($("casurHistorySearch")?.value).split(" · ")[0];
+    selectedHistoryLot = historyLots().find((lot) => text(lot[0]) === id) || null;
+    if (!selectedHistoryLot) { alert("Seleccione una suerte histórica válida."); return; }
+    const select = $("histSeason");
+    select.innerHTML = (selectedHistoryLot[11] || []).map((row) => `<option value="${row[0]}">${String(row[0]).replace(/^(\d{2})(\d{2})$/, "$1/$2")}</option>`).join("");
+    select.value = String((selectedHistoryLot[11] || []).at(-1)?.[0] || "");
+    loadHistorySeason();
+  }
+  function loadHistorySeason() {
+    if (!selectedHistoryLot) return;
+    const season = Number($("histSeason")?.value);
+    const row = (selectedHistoryLot[11] || []).find((item) => Number(item[0]) === season);
+    if (!row) return;
+    setValue("histArea", row[1]); setValue("histTon", row[2]); setValue("histTch", row[3]);
+    setValue("histRto", row[4]); setValue("histAge", row[5]); setValue("histCut", "N/D");
+  }
+  function historicalMetric(rows) {
+    const metric = historicalEngine.aggregateHistoricalRows(rows);
+    return { area: metric.area, ton: metric.ton, tch: metric.tch,
+      rto: metric.katm, edad: metric.edad, corte: null, suertes: metric.suertes, sourceCount: metric.sourceCount,
+      variedad: dominant(rows, "variedad"), riego: dominant(rows, "riego"), zona: dominant(rows, "zona"), tenencia: dominant(rows, "tenencia"),
+      grTenencia: "", zafras: metric.zafras };
+  }
+  function rebuildHistorical() {
+    const app = window.APP_DATA;
+    const lots = historyLots();
+    const allRows = historicalEngine.normalizeHistoricalRows(lots)
+      .filter((row) => row.farmCode !== "16" && !normal(row.zona).includes("0maquila"))
+      .map((row) => ({ ...row, code: row.farmCode, name: row.farmName, tch: row.tchStored, rto: row.katm }));
+    const latestSeason = Number(app.meta?.latestZafra || 2526);
+    const last3 = app.meta?.last3Zafras || [2324, 2425, 2526];
+    const latestCuts = new Map(lots.map((lot) => {
+      const details = Array.isArray(lot[12]) ? lot[12] : [];
+      const first = details[0];
+      const hasFullHistory = Array.isArray(first) && Number.isFinite(Number(first[0])) && String(first[1] || "").includes("/");
+      const detail = hasFullHistory ? details.find((item) => Number(item[0]) === latestSeason) : first;
+      return [text(lot[0]), Array.isArray(detail) ? finite(detail[hasFullHistory ? 10 : 8]) : null];
+    }));
+    const priorEntities = new Map((app.entities || []).map((entity) => [text(entity.code), entity]));
+    const grouped = new Map();
+    allRows.forEach((row) => { if (!grouped.has(row.code)) grouped.set(row.code, []); grouped.get(row.code).push(row); });
+    const entities = [...grouped].map(([code, rows]) => {
+      const prior = priorEntities.get(code) || {};
+      const latestRows = rows.filter((row) => row.zafra === latestSeason);
+      const trend = [...new Set(rows.map((row) => row.zafra))].sort().map((zafra) => ({ zafra,
+        label: String(zafra).replace(/^(\d{2})(\d{2})$/, "$1/$2"), ...historicalMetric(rows.filter((row) => row.zafra === zafra)) }));
+      const latest = historicalMetric(latestRows);
+      const hist = historicalMetric(rows);
+      const last = historicalMetric(rows.filter((row) => last3.includes(row.zafra)));
+      return { ...prior, code, name: rows[0]?.name || prior.name || "", latest, hist, last3: last, trend,
+        zona: latest.zona || hist.zona, variedad: latest.variedad || hist.variedad, riego: latest.riego || hist.riego, tenencia: latest.tenencia || hist.tenencia,
+        details: latestRows.map((row) => ({ suerte: row.suerte, hhhsss: row.lotId, codLote: row.lotId, variedad: row.variedad,
+          riego: row.riego, area: row.area, ton: row.ton, tch: row.tch, rto: row.rto, edad: row.edad, corte: latestCuts.get(text(row.lotId)) ?? null, zona: row.zona, alerta: "" })),
+        search: normal(`${code} ${rows[0]?.name} ${latest.zona} ${latest.variedad} ${latest.riego}`) };
+    }).sort((a, b) => a.name.localeCompare(b.name, "es"));
+    const latestRows = allRows.filter((row) => row.zafra === latestSeason);
+    app.entities = entities;
+    app.options = entities.map((entity) => ({ code: entity.code, name: entity.name, label: `${entity.code} · ${entity.name}` }));
+    app.global.latest = historicalMetric(latestRows);
+    app.global.hist = historicalMetric(allRows);
+    app.global.last3 = historicalMetric(allRows.filter((row) => last3.includes(row.zafra)));
+    app.global.trend = [...new Set(allRows.map((row) => row.zafra))].sort().map((zafra) => ({ zafra,
+      label: String(zafra).replace(/^(\d{2})(\d{2})$/, "$1/$2"), ...historicalMetric(allRows.filter((row) => row.zafra === zafra)) }));
+    app.meta = { ...app.meta, manualChanges: true, generated: new Date().toISOString().slice(0, 10) };
+    window.CASUR_ADMIN_HISTORICO = app;
+  }
+  function saveHistorySeason() {
+    if (!selectedHistoryLot) { alert("Primero seleccione una suerte histórica."); return; }
+    const season = Number($("histSeason")?.value);
+    const row = (selectedHistoryLot[11] || []).find((item) => Number(item[0]) === season);
+    const area = finite($("histArea")?.value); const ton = finite($("histTon")?.value);
+    if (!row || !(area > 0) || ton === null || ton < 0) { alert("Área y toneladas históricas válidas son obligatorias."); return; }
+    row[1] = round(area); row[2] = round(ton); row[3] = round(ton / area); row[4] = round(finite($("histRto")?.value));
+    row[5] = round(finite($("histAge")?.value));
+    rebuildHistorical();
+    setValue("histTch", row[3]);
+    addLog(`Histórico ${selectedHistoryLot[0]} · zafra ${season} actualizado.`);
+    if (typeof window.restoreView === "function") window.restoreView();
+  }
+
+  function switchEditor(type) {
+    const crono = type === "crono";
+    $("casurCronoEditor").hidden = !crono;
+    $("casurHistoryEditor").hidden = crono;
+    document.querySelectorAll(".casur-admin-tab").forEach((button) => button.classList.toggle("is-active", button.dataset.editor === type));
+  }
+
+  function applyImportedExcel() {
+    if (typeof window.masterApplyPendingData !== "function") { alert("Primero cargue y valide el Excel oficial."); return; }
+    const data = window.masterApplyPendingData();
+    if (!data) { alert("No hay una carga válida para aplicar o contiene errores críticos."); return; }
+    applyCronoData(data, "Excel oficial aplicado a la vista y preparado para publicar.");
+  }
+
+  async function ensureJsZip() {
+    if (window.JSZip) return window.JSZip;
+    const node = $("casurEmbeddedJsZipB64");
+    if (!node) throw new Error("No se encontró el componente ZIP integrado.");
+    const binary = atob(text(node.textContent).replace(/\s+/g, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "text/javascript" }));
+    await new Promise((resolve, reject) => {
+      const script = document.createElement("script"); script.src = url; script.onload = resolve; script.onerror = reject; document.head.append(script);
+    });
+    URL.revokeObjectURL(url);
+    if (!window.JSZip) throw new Error("No se pudo iniciar el generador ZIP.");
+    return window.JSZip;
+  }
+  function downloadBlob(name, blob) {
+    const anchor = document.createElement("a"); anchor.href = URL.createObjectURL(blob); anchor.download = name;
+    document.body.append(anchor); anchor.click(); setTimeout(() => { URL.revokeObjectURL(anchor.href); anchor.remove(); }, 1000);
+  }
+  async function downloadDataUpdate() {
+    try {
+      const version = text($("casurPublishVersion")?.value) || `${new Date().toISOString().slice(0, 10).replace(/-/g, ".")}-${String(Date.now()).slice(-4)}`;
+      // Packaging a proposed release must not relabel the dataset still in use.
+      const cronologico = { ...(window.CASUR_ADMIN_DATA || window.CRONO_DATA) };
+      const historico = { ...(window.CASUR_ADMIN_HISTORICO || window.APP_DATA) };
+      cronologico.meta = { ...cronologico.meta, dataVersion: version, publishedAt: new Date().toISOString() };
+      historico.meta = { ...historico.meta, sourceDataVersion:historico.meta?.sourceDataVersion||historico.meta?.dataVersion||null, dataVersion: version, publishedAt: new Date().toISOString() };
+      const release = { version, publishedAt: new Date().toISOString(), source: cronologico.meta?.source || "Centro Maestro",
+        sheet: cronologico.meta?.sheet||"REPORTE", tchEst2627EffectiveDate: cronologico.meta?.operationalContract?cronologico.meta.tchEst2627EffectiveDate:ESTIMATE_DATE, cronologicoRows: cronologico.global?.suertes || 0,
+        historicoRows: historico.meta?.rows || 0 };
+      const JSZip = await ensureJsZip();
+      const zip = new JSZip();
+      zip.file("data/cronologico.js", `window.CASUR_REMOTE_CRONO=${JSON.stringify(cronologico)};\n`);
+      zip.file("data/cronologico.json", `${JSON.stringify(cronologico, null, 2)}\n`);
+      zip.file("data/historico.js", `window.CASUR_REMOTE_HISTORICO=${JSON.stringify(historico)};\n`);
+      zip.file("data/historico.json", `${JSON.stringify(historico)}\n`);
+      zip.file("data/version.js", `window.CASUR_RELEASE=${JSON.stringify(release)};\n`);
+      zip.file("data/version.json", `${JSON.stringify(release, null, 2)}\n`);
+      const integrity={schemaVersion:1,dataVersion:version,files:{}};
+      for(const kind of ['version','cronologico','historico'])for(const ext of ['json','js']){
+        const name=kind+'.'+ext,bytes=await zip.file('data/'+name).async('uint8array');
+        integrity.files[name]=[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
+      }
+      zip.file('data/integrity.json',JSON.stringify(integrity,null,2)+'\n');
+      zip.file("LEEME_ACTUALIZACION.txt", "ACTUALIZACIÓN DE DATOS CASUR\n\n1. Descomprima este ZIP.\n2. En GitHub abra la carpeta data del repositorio.\n3. Suba los seis archivos y su integrity.json juntos a modules/produccion/data.\n4. Confirme el commit.\n5. Los dispositivos recibirán la nueva versión al abrir la app con internet.\n\nNo reemplace index.html para una actualización normal de datos.\n");
+      downloadBlob(`CASUR_ACTUALIZACION_DATOS_${version.replace(/[^A-Za-z0-9.-]+/g, "_")}.zip`, await zip.generateAsync({ type: "blob" }));
+      addLog(`Paquete GitHub ${version} generado.`);
+    } catch (error) { console.error(error); alert(`No se pudo generar el paquete: ${error.message || error}`); }
+  }
+
+  /* [Fase 4.4.3] Comparador robusto de versiones de datos (NO lexicográfico).
+     Soporta los esquemas vigentes: "2026.09.05-siagri.1055" (adaptador SIAGRI)
+     y "2026.09.01-2627.1" (publicación de código). Compara primero por fecha
+     AAAA.MM.DD y, si coincide, por el número final como desempate. Valida
+     FECHA REAL (mes 1-12, día válido para ese mes, año en rango razonable) y
+     secuencia como entero seguro no negativo: rechaza fechas imposibles.
+     Formatos no reconocidos o fechas inválidas devuelven null (el llamador
+     debe tratarlos como "no actualizar", nunca como "más nueva"). */
+  function parseCasurDataVersion(v) {
+    if (typeof v !== "string") return null;
+    const m = v.match(/^(\d{4})\.(\d{2})\.(\d{2})-([a-zA-Z0-9]+)\.(\d+)$/);
+    if (!m) return null;
+    const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]), seq = Number(m[5]);
+    if (year < 2020 || year > 2100) return null;
+    if (month < 1 || month > 12) return null;
+    if (day < 1 || day > 31) return null;
+    if (!Number.isSafeInteger(seq) || seq < 0) return null;
+    const d = new Date(Date.UTC(year, month - 1, day));
+    if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+    return { date: year * 10000 + month * 100 + day, seq };
+  }
+  /* Devuelve 1 si a es más nueva que b, -1 si a es más antigua, 0 si son
+     iguales (o equivalentes), y null si no se pueden interpretar/comparar. */
+  function compareCasurDataVersions(a, b) {
+    if (a === b) return 0;
+    const pa = parseCasurDataVersion(a);
+    const pb = parseCasurDataVersion(b);
+    if (!pa || !pb) return null;
+    if (pa.date !== pb.date) return pa.date > pb.date ? 1 : -1;
+    if (pa.seq !== pb.seq) return pa.seq > pb.seq ? 1 : -1;
+    return 0;
+  }
+  window.CASUR_COMPARE_DATA_VERSIONS = compareCasurDataVersions;
+
+  let dataSyncInProgress = false;
+
+  function updateSyncPill(message, cls) {
+    const pill = $("casurSyncPill");
+    if (!pill) return;
+    pill.textContent = message;
+    pill.className = "casur-sync-pill" + (cls ? " " + cls : "");
+  }
+
+  function moduleToast(message) {
+    const el = document.getElementById("casurInstallToast");
+    if (!el) return;
+    el.textContent = message;
+    el.hidden = false;
+    requestAnimationFrame(() => el.classList.add("show"));
+    clearTimeout(moduleToast._t);
+    moduleToast._t = setTimeout(() => { el.classList.remove("show"); setTimeout(() => (el.hidden = true), 220); }, 3200);
+  }
+
+  /* GEO-1 · Integración quirúrgica con el motor geográfico compartido.
+     La identidad territorial siempre nace del Maestro (`lotCompact`):
+     lot[0] = lotId / CodSuerte y lot[8] = código de finca. El Shape no se
+     usa para reconstruir fincas ni para aportar datos agronómicos. */
+  let geoFichaObserver = null;
+  let geoCronoObserver = null;
+  let geoMapController = null;
+  let geoReturnFocus = null;
+  let geoRequest = 0;
+  let geoActiveContext = null;
+  let geoFeatures = [];
+  let geoExportBusy = false;
+  let geoHtml2CanvasPromise = null;
+  let geoCardCollapsed = false;
+
+  function geoLotId(value) {
+    return text(value).toUpperCase();
+  }
+
+  function activeHistoricalEntity() {
+    /* currentEntity es el estado canónico del script clásico de index.html.
+       El fallback conserva compatibilidad si en el futuro se expone solo
+       getEntity() y evita inferir identidad desde textos visibles. */
+    try {
+      if (typeof currentEntity !== "undefined" && currentEntity) return currentEntity;
+    } catch (error) {}
+    const code = text($("producerSelect")?.value);
+    try {
+      return code && typeof window.getEntity === "function" ? window.getEntity(code) : null;
+    } catch (error) { return null; }
+  }
+
+  function geoLotIdsForEntity(entity, lots = historyLots()) {
+    if (!entity) return [];
+    if (entity.entityType === "lote") {
+      const lotId = geoLotId(entity.codLote || entity.displayCode || text(entity.code).replace(/^LOTE::/i, ""));
+      return lotId ? [lotId] : [];
+    }
+    const farmCode = text(entity.code);
+    return [...new Set((lots || [])
+      .filter((lot) => Array.isArray(lot) && text(lot[8]) === farmCode)
+      .map((lot) => geoLotId(lot[0])).filter(Boolean))];
+  }
+
+  function geoOfficialArea(entity) {
+    if (!entity || entity.entityType !== "lote") return null;
+    const latest = finite(entity.latest?.area);
+    if (latest !== null) return latest;
+    const lotId = geoLotIdsForEntity(entity)[0];
+    const lot = historyLots().find((row) => geoLotId(row?.[0]) === lotId);
+    return finite(lot?.[12]?.[0]?.[3]);
+  }
+
+  function geoCronoProducer(code) {
+    const farmCode = text(code);
+    return (window.CRONO_DATA?.producers || []).find((producer) => text(producer.code) === farmCode) || null;
+  }
+
+  function geoCurrentLotId(row) {
+    return geoLotId(row?.codLote || `${text(row?.code)}${text(row?.suerte)}`);
+  }
+
+  function geoCurrentLotIds(farmCode, data = window.CRONO_DATA) {
+    const producer = (data?.producers || []).find((item) => text(item.code) === text(farmCode));
+    return [...new Set((producer?.details || []).map(geoCurrentLotId).filter(Boolean))];
+  }
+
+  function geoHistoricalFarmCode(entity) {
+    if (!entity) return "";
+    if (entity.entityType !== "lote") return text(entity.code);
+    const lotId = geoLotIdsForEntity(entity)[0];
+    return text(historyLots().find((row) => geoLotId(row?.[0]) === lotId)?.[8]);
+  }
+
+  function geoHistoricalContext(entity) {
+    if (!entity) return null;
+    const selectedLotId = entity.entityType === "lote" ? geoLotIdsForEntity(entity)[0] : "";
+    const farmCode = geoHistoricalFarmCode(entity);
+    const producer = geoCronoProducer(farmCode);
+    const currentRows = producer?.details || [];
+    const fallbackIds = geoLotIdsForEntity({ ...entity, code: farmCode, entityType: "finca" });
+    const currentIds = currentRows.map(geoCurrentLotId).filter(Boolean);
+    return {
+      kind: "geo-context",
+      source: "historico",
+      entityType: selectedLotId ? "lote" : "finca",
+      farmCode,
+      name: text(producer?.name || entity.name || entity.label || farmCode),
+      selectedLotId,
+      originLotId: selectedLotId,
+      currentRows,
+      currentIds,
+      lotIds: [...new Set([...(currentIds.length ? currentIds : fallbackIds), selectedLotId].filter(Boolean))],
+      historicalEntity: entity,
+    };
+  }
+
+  function geoCronoContext() {
+    const scope = currentCronoScope();
+    const producer = scope.producer;
+    if (!producer) return null;
+    const isLot = $("cronoContent")?.dataset.geoScope === "lot";
+    const selectedLotId = isLot ? geoLotId($("cronoContent")?.dataset.geoLotId || geoCurrentLotId(scope.rows[0])) : "";
+    const currentRows = producer.details || [];
+    const currentIds = currentRows.map(geoCurrentLotId).filter(Boolean);
+    return {
+      kind: "geo-context",
+      source: "cronologico",
+      entityType: isLot ? "lote" : "finca",
+      farmCode: text(producer.code),
+      name: text(producer.name || producer.code),
+      selectedLotId,
+      originLotId: selectedLotId,
+      currentRows,
+      currentIds,
+      lotIds: [...new Set(currentIds)],
+    };
+  }
+
+  function geoContext(value) {
+    return value?.kind === "geo-context" ? value : geoHistoricalContext(value);
+  }
+
+  function geoRecordForLot(context, lotId) {
+    const normalized = geoLotId(lotId);
+    return (context?.currentRows || []).find((row) => geoCurrentLotId(row) === normalized) || null;
+  }
+
+  function geoFeatureForLot(lotId) {
+    const normalized = geoLotId(lotId);
+    return geoFeatures.find((feature) => geoLotId(feature?.properties?.lotId) === normalized) || null;
+  }
+
+  function geoAnchor(feature) {
+    const value = feature?.properties?.anchor;
+    return Array.isArray(value) && value.length === 2 && value.every(Number.isFinite) ? value : null;
+  }
+
+  function geoCopyCoordinates(value) {
+    if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
+    const input = document.createElement("textarea");
+    input.value = value;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+    return Promise.resolve();
+  }
+
+  function geoSeasonLabel(value) {
+    const number = finite(value);
+    if (number === null) return "N/D";
+    if (number >= 2000 && number < 2100) {
+      const year = number % 100;
+      return `${String(year - 1).padStart(2, "0")}/${String(year).padStart(2, "0")}`;
+    }
+    const raw = String(number);
+    return raw.length === 4 ? `${raw.slice(0, 2)}/${raw.slice(2)}` : raw;
+  }
+
+  function geoMetric(value, suffix = "") {
+    return finite(value) === null ? "N/D" : `${nf.format(Number(value))}${suffix}`;
+  }
+
+  function geoCount(value) {
+    return finite(value) === null ? "N/D" : nf0.format(Number(value));
+  }
+
+  function geoSuerteLabel(context, lotId) {
+    const normalized = geoLotId(lotId);
+    if (!normalized) return "N/D";
+    const current = geoRecordForLot(context, normalized);
+    const historical = historyLots().find((row) => geoLotId(row?.[0]) === normalized);
+    const explicit = text(current?.suerte || historical?.[10]).replace(/^suerte\s+/i, "");
+    return explicit || "N/D";
+  }
+
+  function geoChronologicalLotTooltipLabel(context, lotId) {
+    const label = geoSuerteLabel(context, lotId);
+    return label === "N/D" ? `CodSuerte ${geoLotId(lotId)}` : `Suerte ${label}`;
+  }
+
+  function geoHistoricalLotSubject(context, lotId) {
+    const normalized = geoLotId(lotId);
+    return `Suerte ${geoSuerteLabel(context, normalized)} · Cod. ${normalized || "N/D"}`;
+  }
+
+  function geoHistoricalCardModel(context, lotId = "", lots = historyLots()) {
+    const required = ["normalizeHistoricalRows", "filterHistoricalRows", "aggregateHistoricalRows", "groupHistoricalBySeason", "buildHistoricalAgronomicKpis"];
+    if (!historicalEngine || required.some((name) => typeof historicalEngine[name] !== "function")) return null;
+    const selectedLotId = geoLotId(lotId);
+    const rows = historicalEngine.normalizeHistoricalRows(lots);
+    const scope = selectedLotId ? { lotId: selectedLotId } : { farmCode: text(context?.farmCode) };
+    const scopeRows = historicalEngine.filterHistoricalRows(rows, scope);
+    const seasons = historicalEngine.groupHistoricalBySeason(scopeRows);
+    const latestSeason = seasons.length ? seasons[seasons.length - 1].zafra : null;
+    const latestRows = latestSeason === null ? [] : historicalEngine.filterHistoricalRows(scopeRows, null, [latestSeason]);
+    return {
+      entityType: selectedLotId ? "lote" : "finca",
+      selectedLotId,
+      farmCode: text(context?.farmCode),
+      farmName: text(context?.name || scopeRows[0]?.farmName || context?.farmCode),
+      latestSeason,
+      latest: historicalEngine.aggregateHistoricalRows(latestRows),
+      allHistory: historicalEngine.aggregateHistoricalRows(scopeRows),
+      historicalKpis: historicalEngine.buildHistoricalAgronomicKpis(scopeRows, seasons.map((season) => season.zafra)),
+      hasData: scopeRows.length > 0,
+    };
+  }
+
+  function geoFieldsMarkup(fields) {
+    return `<dl>${fields.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>`;
+  }
+
+  function geoCardSectionMarkup(title, fields) {
+    return `<section class="casur-geo-card-section"><h3>${esc(title)}</h3>${geoFieldsMarkup(fields)}</section>`;
+  }
+
+  function geoDate(value) {
+    return value ? formatDate(value) : "N/D";
+  }
+
+  function geoIcon(name) {
+    const paths = {
+      collapse: '<path d="m5 9 7 7 7-7"/>',
+      copy: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
+      map: '<path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/>',
+      detail: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+    };
+    return `<svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">${paths[name] || paths.detail}</svg>`;
+  }
+
+  function geoCoordinatesMarkup(context, selected, interactive = true) {
+    if (!selected) return "";
+    const anchor = geoAnchor(geoFeatureForLot(selected));
+    if (!anchor) return '<p class="casur-geo-card-note">Coordenadas no disponibles.</p>';
+    const coordinates = `${anchor[1].toFixed(6)}, ${anchor[0].toFixed(6)}`;
+    const lotLabel = geoSuerteLabel(context, selected);
+    return `<div class="casur-geo-coordinates"><span><b>Coordenada de referencia</b>${esc(coordinates)}</span>${interactive ? `<div class="casur-geo-inline-actions"><button class="casur-geo-icon-action" type="button" data-geo-copy="${esc(coordinates)}" aria-label="Copiar coordenadas de la suerte ${esc(lotLabel)} · CodSuerte ${esc(selected)}" title="Copiar coordenada">${geoIcon("copy")}</button><a class="casur-geo-icon-action" href="https://www.google.com/maps?q=${encodeURIComponent(coordinates)}" target="_blank" rel="noopener noreferrer" aria-label="Abrir coordenadas de la suerte ${esc(lotLabel)} · CodSuerte ${esc(selected)} en Google Maps" title="Abrir en Google Maps">${geoIcon("map")}</a></div>` : ""}</div>`;
+  }
+
+  function geoSelectedDetailMode(context, lotId) {
+    const selected = geoLotId(lotId);
+    if (!context || !selected) return "";
+    if (context.source === "historico") {
+      const model = geoHistoricalCardModel(context, selected);
+      return model?.hasData && typeof window.renderEntity === "function" ? "historico" : "";
+    }
+    const record = geoRecordForLot(context, selected);
+    return record && typeof window.selectCronoSuerteSuggestion === "function" ? "cronologico" : "";
+  }
+
+  function geoSelectedDetailLabel(context, lotId) {
+    const selected = geoLotId(lotId);
+    const mode = geoSelectedDetailMode(context, selected);
+    if (mode === "historico") return `Ver histórico ${selected}`;
+    if (mode === "cronologico") return `Ver ficha ${geoSuerteLabel(context, selected)}`;
+    return "Volver a la ficha";
+  }
+
+  function geoChronologicalCardMarkup(context, lotId = "", interactive = true) {
+    const selected = geoLotId(lotId);
+    const operational = window.CRONO_DATA?.meta?.operationalContract === 1;
+    const estimateSeason = operational ? (window.CRONO_DATA.meta.estimateSeason || '—') : '26/27';
+    if (!selected) {
+      const producer = geoCronoProducer(context?.farmCode);
+      const rows = context?.currentRows || [];
+      const estimate = estimateSummary(rows);
+      const area = finite(producer?.area) ?? rows.reduce((sum, row) => sum + (finite(row?.area) || 0), 0);
+      const fields = [
+        [operational ? "Área activa" : "Área actual", geoMetric(area, " ha")],
+        [operational ? "TCH anterior" : "TCH 25/26", geoMetric(finite(producer?.tch) ?? weighted(rows, "tch"))],
+        [`Est. ${estimateSeason}`, geoMetric(operational ? estimate.estimateTch : estimate.tchEst2627)],
+        [operational ? "Suertes activas" : "Suertes actuales", geoCount(operational ? rows.filter(row => row.participatesCurrentArea).length : rows.length)],
+        ["Destino dom.", dominant(rows, "destino") || "N/D"],
+      ];
+      return `<div class="casur-geo-card-head"><div><span>Cronológico vigente</span><strong>Finca ${esc(context?.farmCode || "N/D")}</strong></div><em>${esc(context?.name || "")}</em></div>${geoFieldsMarkup(fields)}<p class="casur-geo-card-note">Seleccione una suerte para consultar su ficha operativa actual.</p>`;
+    }
+    const record = geoRecordForLot(context, selected);
+    const feature = geoFeatureForLot(selected);
+    const history = record ? geoHistoricalCardModel(context, selected) : null;
+    const name = text(context?.name) || "N/D";
+    const identification = record ? [
+      ["Suerte", geoSuerteLabel(context, selected)],
+      ["Código hacienda", text(context?.farmCode) || "N/D"],
+      ["CodSuerte", selected],
+      ["Área", geoMetric(record.area, " ha")],
+      ["Variedad", text(record.variedad) || "N/D"],
+    ] : [];
+    const agronomy = record ? [
+      ["Edad", geoMetric(record.edadExcel, " meses")],
+      ["Fecha base", geoDate(record.fBase)],
+      ["Fecha siembra", geoDate(record.fSiembra)],
+      ["Fecha último corte", geoDate(record.fUltCte)],
+      ["N.º corte", text(record.corte) || "N/D"],
+      ["Distancia surcos", geoMetric(record.surco, " m")],
+      ["Riego / secano", text(record.tipoRiego) || "N/D"],
+      ["Destino", text(record.destino) || "N/D"],
+      ...(operational ? [["Estado", [text(record.classification),text(record.operationalState)].filter((value,index,list) => value && list.indexOf(value) === index).join(" · ") || "N/D"]] : []),
+    ] : [];
+    const productivity = record ? [
+      [operational ? "TCH anterior" : "TCH 25/26", geoMetric(record.tch)],
+      ["TCH hist. pond.", history?.hasData ? geoMetric(history.allHistory.tch) : "N/D"],
+      [`Est. ${estimateSeason}`, geoMetric(forecastForRow(record, estimateSeason).tch)],
+      ["N.º riegos", geoCount(record.numeroRiegos)],
+    ] : [];
+    return `
+      <div class="casur-geo-card-head"><div><span>Ficha resumida de la suerte</span><strong>${esc(name)}</strong><small>Suerte ${esc(geoSuerteLabel(context, selected))} · Código hacienda: ${esc(context?.farmCode || "N/D")} · CodSuerte: ${esc(selected)}</small></div>${record ? "" : '<em>Sin registro cronológico actual</em>'}</div>
+      ${record ? `${geoCardSectionMarkup("Identificación", identification)}${geoCardSectionMarkup("Estado agronómico", agronomy)}${geoCardSectionMarkup("Indicadores productivos", productivity)}` : `<p class="casur-geo-card-note">${feature ? "El polígono pertenece a la referencia histórica, pero esta suerte no figura en el Cronológico vigente." : "Esta suerte no figura en el Cronológico vigente y no tiene polígono en la referencia geográfica actual."}</p>`}
+      <section class="casur-geo-card-section casur-geo-card-section--location"><h3>Ubicación</h3>${geoCoordinatesMarkup(context, selected, interactive)}
+      ${interactive && record ? `<div class="casur-geo-card-actions casur-geo-card-actions--chrono"><button type="button" data-geo-center-selected="${esc(selected)}" aria-label="Centrar suerte ${esc(selected)}">Centrar suerte</button><button type="button" data-geo-open-selected="${esc(selected)}" aria-label="Abrir ficha completa de la suerte ${esc(selected)}">Ver ficha completa ${geoIcon("detail")}</button></div>` : ""}</section>`;
+  }
+
+  function geoHistoricalCardMarkup(context, lotId = "", interactive = true) {
+    const selected = geoLotId(lotId);
+    const model = geoHistoricalCardModel(context, selected);
+    if (!model) return '<div class="casur-geo-card-empty"><b>Histórico no disponible</b><span>El motor histórico no está disponible en esta sesión.</span></div>';
+    const latest = model.latest;
+    const all = model.allHistory;
+    const kpis = model.historicalKpis;
+    const fields = selected ? [
+      ["Última zafra", geoSeasonLabel(model.latestSeason)],
+      ["Área últ. zafra", model.hasData ? geoMetric(latest.area, " ha") : "N/D"],
+      ["TCH últ. zafra", model.hasData ? geoMetric(latest.tch) : "N/D"],
+      ["KATM últ. zafra", model.hasData ? geoMetric(latest.katm) : "N/D"],
+      ["TCH hist. pond.", model.hasData ? geoMetric(all.tch) : "N/D"],
+      ["KATM hist. pond.", model.hasData ? geoMetric(all.katm) : "N/D"],
+      ["Edad hist. pond.", model.hasData ? geoMetric(all.edad, " meses") : "N/D"],
+      ["Zafras", model.hasData ? geoCount(kpis.seasonCount) : "N/D"],
+      ["Cambio TCH", model.hasData ? geoMetric(kpis.tchChange) : "N/D"],
+      ["CV TCH", model.hasData ? geoMetric(kpis.tchCv, " %") : "N/D"],
+    ] : [
+      ["Última zafra", geoSeasonLabel(model.latestSeason)],
+      ["Área última zafra", model.hasData ? geoMetric(latest.area, " ha") : "N/D"],
+      ["Ton última zafra", model.hasData ? geoMetric(latest.ton, " t") : "N/D"],
+      ["TCH última zafra", model.hasData ? geoMetric(latest.tch) : "N/D"],
+      ["TCH hist. pond.", model.hasData ? geoMetric(all.tch) : "N/D"],
+      ["KATM hist. pond.", model.hasData ? geoMetric(all.katm) : "N/D"],
+      ["Edad hist. pond.", model.hasData ? geoMetric(all.edad, " meses") : "N/D"],
+      ["Zafras", model.hasData ? geoCount(kpis.seasonCount) : "N/D"],
+      ["Suertes históricas", model.hasData ? geoCount(kpis.lotCount) : "N/D"],
+      ["Cambio TCH", model.hasData ? geoMetric(kpis.tchChange) : "N/D"],
+      ["CV TCH", model.hasData ? geoMetric(kpis.tchCv, " %") : "N/D"],
+    ];
+    const title = selected ? `Cod. Suerte ${selected}` : `Finca ${model.farmCode} · Histórico`;
+    const eyebrow = selected ? "Resumen por zafras" : "Resumen histórico ejecutivo";
+    return `<div class="casur-geo-card-head"><div><span>${esc(eyebrow)}</span><strong>${esc(title)}</strong></div>${selected ? "" : `<em>${esc(model.farmName)}</em>`}</div>${geoFieldsMarkup(fields)}${model.hasData ? "" : '<p class="casur-geo-card-note">No existen filas históricas válidas para esta entidad.</p>'}${geoCoordinatesMarkup(context, selected, interactive)}`;
+  }
+
+  function geoCardMarkup(context, lotId = "", interactive = true) {
+    return context?.source === "historico"
+      ? geoHistoricalCardMarkup(context, lotId, interactive)
+      : geoChronologicalCardMarkup(context, lotId, interactive);
+  }
+
+  function geoCardSummaryMarkup(context, lotId = "") {
+    const selected = geoLotId(lotId);
+    let eyebrow = context?.source === "historico" ? "Histórico por zafras" : "Cronológico vigente";
+    let title = selected
+      ? (context?.source === "historico" ? `Cod. Suerte ${selected}` : `Suerte ${geoSuerteLabel(context, selected)}`)
+      : `Finca ${context?.farmCode || "N/D"}`;
+    if (selected && context?.source === "cronologico") eyebrow = `CodSuerte ${selected}`;
+    let metrics = [];
+    if (context?.source === "historico") {
+      const model = geoHistoricalCardModel(context, selected);
+      if (model?.hasData) {
+        metrics = [
+          ["Última", geoSeasonLabel(model.latestSeason)],
+          ["TCH hist.", geoMetric(model.allHistory.tch)],
+          ["CV TCH", geoMetric(model.historicalKpis.tchCv, " %")],
+        ];
+      }
+    } else if (selected) {
+      const record = geoRecordForLot(context, selected);
+      if (record) metrics = [
+        ["Área", geoMetric(record.area, " ha")],
+        ["TCH", geoMetric(record.tch)],
+        ["Est. 26/27", geoMetric(record.tchEst2627)],
+      ];
+    } else {
+      const rows = context?.currentRows || [];
+      const producer = geoCronoProducer(context?.farmCode);
+      const estimate = estimateSummary(rows);
+      metrics = [
+        ["Área", geoMetric(finite(producer?.area) ?? rows.reduce((sum, row) => sum + (finite(row?.area) || 0), 0), " ha")],
+        ["TCH", geoMetric(finite(producer?.tch) ?? weighted(rows, "tch"))],
+        ["Suertes", geoCount(rows.length)],
+      ];
+    }
+    if (!metrics.length) metrics = [["Datos", "N/D"]];
+    return `<div class="casur-geo-card-summary"><div><span>${esc(eyebrow)}</span><strong>${esc(title)}</strong></div><dl>${metrics.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl></div>`;
+  }
+
+  function syncGeoCardCollapse(card, collapsed) {
+    if (!card) return;
+    geoCardCollapsed = Boolean(collapsed);
+    card.dataset.collapsed = String(geoCardCollapsed);
+    const toggle = card.querySelector("[data-geo-card-toggle]");
+    if (!toggle) return;
+    toggle.setAttribute("aria-expanded", String(!geoCardCollapsed));
+    toggle.setAttribute("aria-label", geoCardCollapsed ? "Expandir información del mapa" : "Contraer información del mapa");
+    toggle.setAttribute("title", geoCardCollapsed ? "Expandir información" : "Contraer información");
+  }
+
+  function renderGeoInformationCard(lotId = geoMapController?.getSelectedLotId?.() || geoActiveContext?.selectedLotId || "") {
+    const card = $("casurGeoCard");
+    if (!card || !geoActiveContext) return;
+    const selected = geoLotId(lotId);
+    geoActiveContext.selectedLotId = selected;
+    if (geoActiveContext.source === "cronologico" && geoActiveContext.entityType === "lote" && selected) {
+      $("casurGeoTitle").textContent = `Mapa cronológico · ${geoActiveContext.name || (geoActiveContext.farmCode ? "Finca " + geoActiveContext.farmCode : "Sin nombre")} · Suerte ${geoSuerteLabel(geoActiveContext, selected)}`;
+    }
+    card.classList.toggle("casur-geo-card--chrono-lot", geoActiveContext.source === "cronologico" && Boolean(selected));
+    card.innerHTML = `<button class="casur-geo-card-toggle" type="button" data-geo-card-toggle aria-controls="casurGeoCardExpanded">${geoIcon("collapse")}</button><div class="casur-geo-card-collapsed">${geoCardSummaryMarkup(geoActiveContext, selected)}</div><div class="casur-geo-card-expanded" id="casurGeoCardExpanded">${geoCardMarkup(geoActiveContext, selected, true)}</div>`;
+    syncGeoCardCollapse(card, geoCardCollapsed);
+  }
+
+  function geoNextFrames() {
+    return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }
+
+  function geoDelay(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  function geoLoadHtml2Canvas() {
+    if (!geoHtml2CanvasPromise) {
+      const url = new URL("../riego/assets/html2canvas.esm-BfxBtG_O.js", document.baseURI).href;
+      geoHtml2CanvasPromise = import(url).then((module) => {
+        if (typeof module.default !== "function") throw new Error("Exportador PNG local no disponible");
+        return module.default;
+      });
+    }
+    return geoHtml2CanvasPromise;
+  }
+
+  function geoTileRequirements(baseKey) {
+    if (baseKey === "hybrid") return ["World_Imagery", "World_Transportation"];
+    if (baseKey === "satellite") return ["World_Imagery"];
+    if (baseKey === "osm") return ["openstreetmap"];
+    return [];
+  }
+
+  async function geoWaitForExportTiles(mapNode, baseKey, timeout = 8000) {
+    const required = geoTileRequirements(baseKey);
+    if (!required.length) return;
+    const deadline = Date.now() + timeout;
+    let stableTileCount = 0;
+    let previousTileCount = -1;
+    while (Date.now() < deadline) {
+      const allTiles = [...mapNode.querySelectorAll(".leaflet-tile-pane img.leaflet-tile")];
+      const tiles = allTiles.filter((image) => image.complete && image.naturalWidth > 0);
+      stableTileCount = allTiles.length === previousTileCount ? stableTileCount + 1 : 0;
+      previousTileCount = allTiles.length;
+      const complete = allTiles.length > 0 && tiles.length === allTiles.length
+        && !mapNode.querySelector(".leaflet-tile-loading");
+      if (complete && stableTileCount >= 2
+        && required.every((part) => tiles.some((image) => text(image.currentSrc || image.src).includes(part)))) return;
+      await geoDelay(120);
+    }
+    throw new Error("El mapa base no terminó de cargar; no se generó una imagen incompleta.");
+  }
+
+  function geoBlobDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error("No fue posible preparar una tesela para exportación."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function geoInlineExportTiles(mapNode, baseKey, bounded = false) {
+    const required = geoTileRequirements(baseKey);
+    if (!required.length) return;
+    const tiles = [...mapNode.querySelectorAll(".leaflet-tile-pane img.leaflet-tile")]
+      .filter((image) => image.complete && image.naturalWidth > 0);
+    const sources = tiles.map((image) => text(image.currentSrc || image.src));
+    if (!required.every((part) => sources.some((source) => source.includes(part)))) {
+      throw new Error("Faltan teselas del mapa base para generar el PNG.");
+    }
+    await Promise.all(tiles.map(async (image, index) => {
+      const source = sources[index];
+      const response = await fetch(source, { mode: "cors", cache: "force-cache", ...(bounded ? { signal: AbortSignal.timeout(15000) } : {}) });
+      if (!response.ok) throw new Error(`No fue posible preparar una tesela del mapa base (${response.status}).`);
+      image.removeAttribute("crossorigin");
+      image.src = await geoBlobDataUrl(await response.blob());
+      if (typeof image.decode === "function") await image.decode();
+    }));
+  }
+
+  async function geoRasterizeExportMap(html2canvas, mapNode, directSvg = false) {
+    const width = mapNode.clientWidth || 1088;
+    const height = mapNode.clientHeight || 720;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#e7ece7";
+    context.fillRect(0, 0, width, height);
+    const mapBounds = mapNode.getBoundingClientRect();
+    const tiles = [...mapNode.querySelectorAll(".leaflet-tile-pane img.leaflet-tile")];
+    tiles.forEach((image) => {
+      const bounds = image.getBoundingClientRect();
+      const x = bounds.left - mapBounds.left;
+      const y = bounds.top - mapBounds.top;
+      if (x >= width || y >= height || x + bounds.width <= 0 || y + bounds.height <= 0) return;
+      context.drawImage(image, x, y, bounds.width, bounds.height);
+    });
+
+    if (directSvg) {
+      // Leaflet pans its SVG viewport independently. Draw each actual viewport at
+      // its measured bounds; html2canvas otherwise reapplies its parent transform.
+      for (const svg of mapNode.querySelectorAll(".leaflet-pane svg, .casur-cartographic-labels")) {
+        const bounds = svg.getBoundingClientRect();
+        const copy = svg.cloneNode(true);
+        copy.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+        copy.setAttribute("width", bounds.width); copy.setAttribute("height", bounds.height);
+        copy.style.cssText = "";
+        const url = URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(copy)], { type: "image/svg+xml" }));
+        try {
+          const image = new Image(); image.src = url; await image.decode();
+          context.drawImage(image, bounds.left - mapBounds.left, bounds.top - mapBounds.top, bounds.width, bounds.height);
+        } finally { URL.revokeObjectURL(url); }
+      }
+      return canvas;
+    }
+
+    const tilePane = mapNode.querySelector(".leaflet-tile-pane");
+    const previousVisibility = tilePane?.style.visibility || "";
+    const previousBackground = mapNode.style.background;
+    if (tilePane) tilePane.style.visibility = "hidden";
+    mapNode.style.background = "transparent";
+    try {
+      const overlay = await html2canvas(mapNode, {
+        scale: 1,
+        scrollX: 0,
+        scrollY: 0,
+        useCORS: true,
+        allowTaint: false,
+        logging: false,
+        backgroundColor: null,
+        imageTimeout: 10000,
+        ignoreElements: (element) => Boolean(element.closest?.(".leaflet-control-container") || element.classList?.contains("casur-geo-offline-notice")),
+      });
+      context.drawImage(overlay, 0, 0);
+      return canvas;
+    } finally {
+      if (tilePane) tilePane.style.visibility = previousVisibility;
+      mapNode.style.background = previousBackground;
+    }
+  }
+
+  function geoCanvasHasContent(canvas) {
+    if (!canvas || canvas.width < 20 || canvas.height < 20) return false;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const colors = new Set();
+    const step = Math.max(4, Math.floor((canvas.width * canvas.height) / 1400) * 4);
+    for (let index = 0; index < pixels.length && colors.size < 8; index += step) {
+      if (pixels[index + 3] < 16) continue;
+      colors.add(`${pixels[index] >> 4}:${pixels[index + 1] >> 4}:${pixels[index + 2] >> 4}`);
+    }
+    return colors.size >= 3;
+  }
+
+  function geoExportAttribution(baseKey) {
+    if (baseKey === "hybrid") return "Tiles © Esri · Referencia vial © Esri · Geometría agrícola CASUR";
+    if (baseKey === "satellite") return "Tiles © Esri · Geometría agrícola CASUR";
+    if (baseKey === "osm") return "© OpenStreetMap contributors · Geometría agrícola CASUR";
+    return "Geometría agrícola CASUR · Sin mapa base";
+  }
+
+  function geoSafeFilenamePart(value) {
+    return text(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "CASUR";
+  }
+
+  function geoExportFilename(context, mode, selected) {
+    if (mode === "farm") {
+      return `CASUR_Mapa_Finca_${geoSafeFilenamePart(context.farmCode)}_${geoSafeFilenamePart(context.name)}.png`;
+    }
+    const source = context.source === "historico" ? "Historico" : "Cronologico";
+    return `CASUR_Mapa_${source}_${geoSafeFilenamePart(selected)}.png`;
+  }
+
+  async function geoCaptureExportMap(html2canvas, context, mode, selected, configuration = null) {
+    const createMap = window.createCasurMap;
+    const features = configuration?.features || geoFeatures;
+    if (typeof createMap !== "function" || !features.length) throw new Error("No hay geometría cargada para exportar.");
+    const activeBase = configuration?.base || geoMapController?.getActiveBase?.() || "hybrid";
+    const host = document.createElement("div");
+    host.className = "casur-geo-export-map-host";
+    const mapNode = document.createElement("div");
+    mapNode.className = "casur-geo-map casur-geo-export-map";
+    if (configuration) {
+      mapNode.className = "casur-geo-map";
+      host.style.cssText = "position:fixed;left:-20000px;top:0;width:1400px;height:1000px;";
+      mapNode.style.cssText = "width:1400px;height:1000px;max-width:none;max-height:none;";
+    }
+    host.appendChild(mapNode);
+    document.body.appendChild(host);
+    let controller = null;
+    try {
+      controller = await Promise.resolve(createMap(mapNode, {
+        initialBase: activeBase,
+        autoFit: false,
+        fitPadding: [56, 56],
+        maxFitZoom: 17,
+        layersCollapsed: true,
+        ...(context.source === "cronologico" ? { lotTooltipLabel: (_feature, lotId) => geoChronologicalLotTooltipLabel(context, lotId) } : {}),
+        ...(configuration?.mapOptions || {}),
+        mapOptions: { ...(configuration?.mapOptions?.mapOptions || {}), zoomControl: false, attributionControl: false },
+      }));
+      const mapSelection = mode === "lot" ? selected : "";
+      await Promise.resolve(controller.setLots(features, mapSelection));
+      await Promise.resolve(mode === "lot" ? controller.fitToLot(selected) : controller.fitToData());
+      await geoNextFrames();
+      await geoWaitForExportTiles(mapNode, activeBase, configuration ? 20000 : 8000);
+      if (activeBase !== "blank" && controller.getActiveBase?.() !== activeBase) {
+        throw new Error("El mapa base falló durante la captura; no se descargó una lámina incompleta.");
+      }
+      await geoInlineExportTiles(mapNode, activeBase, Boolean(configuration));
+      const canvas = await geoRasterizeExportMap(html2canvas, mapNode, Boolean(configuration));
+      canvas.toDataURL("image/png");
+      if (!geoCanvasHasContent(canvas)) throw new Error("La captura del mapa no contiene información visual suficiente.");
+      return { canvas, baseKey: activeBase, tileCount: mapNode.querySelectorAll(".leaflet-tile-pane img.leaflet-tile").length };
+    } finally {
+      try { controller?.destroy?.(); } catch (error) {}
+      host.remove();
+    }
+  }
+
+  // The multifarm report uses the same tile readiness, CORS and rasterization pipeline.
+  window.CASUR_GEO_EXPORT = Object.freeze({
+    capture: async (configuration) => geoCaptureExportMap(null, {}, "farm", "", configuration),
+    attribution: geoExportAttribution,
+  });
+
+  async function geoBuildExportSheet(html2canvas, context, mode, selected, mapCapture) {
+    const host = document.createElement("div");
+    host.className = "casur-geo-export-sheet-host";
+    const sheet = document.createElement("section");
+    sheet.className = `casur-geo-export-sheet casur-geo-export-sheet--${context.source === "historico" ? "historico" : "cronologico"} casur-geo-export-sheet--${mode}`;
+    const sourceTitle = context.source === "historico" ? "Mapa Histórico · CASUR" : "Mapa Cronológico · CASUR";
+    const subject = mode === "lot"
+      ? (context.source === "historico"
+        ? `${context.name || `Finca ${context.farmCode}`} · ${geoHistoricalLotSubject(context, selected)}`
+        : `${context.name || ("Finca " + context.farmCode)} · Suerte ${geoSuerteLabel(context, selected)} · CodSuerte ${selected}`)
+      : (context.source === "cronologico"
+        ? `${context.name || ("Finca " + context.farmCode)} · Código ${context.farmCode}`
+        : `Finca ${context.farmCode} · ${context.name || context.farmCode}`);
+    const generated = new Date().toLocaleString("es-NI", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    sheet.innerHTML = `
+      <header class="casur-geo-export-head"><div><span>Departamento de Negocios de Caña</span><h1>${esc(sourceTitle)}</h1><p>${esc(subject)}</p></div><strong>CASUR</strong></header>
+      <div class="casur-geo-export-body"><figure><img alt="${esc(subject)}"><figcaption>${esc(geoExportAttribution(mapCapture.baseKey))}</figcaption></figure><aside class="casur-geo-card casur-geo-export-card">${geoCardMarkup(context, mode === "lot" ? selected : "", false)}</aside></div>
+      <footer><span>Generado ${esc(generated)}</span><span>Referencia agrícola CASUR</span></footer>`;
+    const image = sheet.querySelector("img");
+    image.src = mapCapture.canvas.toDataURL("image/png");
+    host.appendChild(sheet);
+    document.body.appendChild(host);
+    try {
+      if (typeof image.decode === "function") await image.decode();
+      await geoNextFrames();
+      const canvas = await html2canvas(sheet, {
+        scale: 1,
+        scrollX: 0,
+        scrollY: 0,
+        useCORS: true,
+        allowTaint: false,
+        logging: false,
+        backgroundColor: "#f4f7f4",
+        width: 1600,
+        imageTimeout: 10000,
+      });
+      canvas.toDataURL("image/png");
+      if (canvas.width < 1600 || !geoCanvasHasContent(canvas)) throw new Error("La lámina ejecutiva no pudo validarse.");
+      return canvas;
+    } finally {
+      host.remove();
+    }
+  }
+
+  function geoCanvasBlob(canvas) {
+    return new Promise((resolve, reject) => canvas.toBlob((blob) => {
+      if (blob && blob.size > 1000) resolve(blob);
+      else reject(new Error("El archivo PNG generado está vacío."));
+    }, "image/png", 1));
+  }
+
+  function geoDownloadBlob(blob, filename) {
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => { URL.revokeObjectURL(link.href); link.remove(); }, 1600);
+  }
+
+  async function exportCasurGeoPng(mode = "farm", options = {}) {
+    if (geoExportBusy) throw new Error("Ya hay una exportación GEO en curso.");
+    if (!geoActiveContext || !geoMapController) throw new Error("Abra primero el visor GEO.");
+    const normalizedMode = mode === "lot" ? "lot" : "farm";
+    const selected = geoLotId(geoMapController.getSelectedLotId?.() || geoActiveContext.selectedLotId);
+    if (normalizedMode === "lot" && !selected) throw new Error("Seleccione una suerte antes de exportar PNG suerte.");
+    geoExportBusy = true;
+    const priorScroll = { x: window.scrollX || 0, y: window.scrollY || 0 };
+    const toggleHandlers = [...document.querySelectorAll("details[ontoggle]")]
+      .map((details) => [details, details.getAttribute("ontoggle")]);
+    try {
+      if (priorScroll.x || priorScroll.y) {
+        window.scrollTo(0, 0);
+        await geoNextFrames();
+      }
+      const context = { ...geoActiveContext, selectedLotId: selected };
+      const html2canvas = await geoLoadHtml2Canvas();
+      // html2canvas clones the document; inline toggles in the clone cannot call app globals.
+      toggleHandlers.forEach(([details]) => details.removeAttribute("ontoggle"));
+      const mapCapture = await geoCaptureExportMap(html2canvas, context, normalizedMode, selected);
+      const canvas = await geoBuildExportSheet(html2canvas, context, normalizedMode, selected, mapCapture);
+      const blob = await geoCanvasBlob(canvas);
+      const filename = geoExportFilename(context, normalizedMode, selected);
+      if (options.download !== false) geoDownloadBlob(blob, filename);
+      return { blob, filename, width: canvas.width, height: canvas.height, baseKey: mapCapture.baseKey, mode: normalizedMode };
+    } finally {
+      toggleHandlers.forEach(([details, handler]) => details.setAttribute("ontoggle", handler));
+      if (priorScroll.x || priorScroll.y) window.scrollTo(priorScroll.x, priorScroll.y);
+      geoExportBusy = false;
+    }
+  }
+
+  async function runGeoExport(mode, button) {
+    const farmButton = $("casurGeoPngFarm");
+    const lotButton = $("casurGeoPngLot");
+    const previous = $("casurGeoStatus")?.textContent || "";
+    if (button) button.setAttribute("aria-busy", "true");
+    if (farmButton) farmButton.disabled = true;
+    if (lotButton) lotButton.disabled = true;
+    if ($("casurGeoStatus")) $("casurGeoStatus").textContent = "Generando PNG ejecutivo…";
+    try {
+      const result = await exportCasurGeoPng(mode);
+      moduleToast(`${result.filename} descargado`);
+      if ($("casurGeoStatus")) $("casurGeoStatus").textContent = "PNG generado correctamente";
+    } catch (error) {
+      console.error("[CASUR GEO] Exportación PNG fallida:", error);
+      if ($("casurGeoStatus")) $("casurGeoStatus").textContent = `PNG no generado · ${error.message || error}`;
+      window.alert?.(`No fue posible exportar el mapa: ${error.message || error}`);
+    } finally {
+      if (button) button.removeAttribute("aria-busy");
+      if (farmButton) farmButton.disabled = !geoFeatures.length;
+      if (lotButton) lotButton.disabled = !geoMapController?.getSelectedLotId?.();
+      if ($("casurGeoStatus")?.textContent === "Generando PNG ejecutivo…") $("casurGeoStatus").textContent = previous;
+    }
+  }
+
+  function syncGeoControls() {
+    const selected = geoLotId(geoMapController?.getSelectedLotId?.() || geoActiveContext?.selectedLotId);
+    const origin = geoLotId(geoActiveContext?.originLotId);
+    const fitFarm = $("casurGeoFitFarm");
+    const fitLot = $("casurGeoFitLot");
+    const pngFarm = $("casurGeoPngFarm");
+    const pngLot = $("casurGeoPngLot");
+    if (fitFarm) fitFarm.disabled = !geoFeatures.length;
+    if (fitLot) {
+      const originLabel = geoSuerteLabel(geoActiveContext, origin);
+      fitLot.textContent = origin ? `Volver a ${originLabel}` : "Centrar seleccionada";
+      fitLot.setAttribute("aria-label", origin ? `Volver a la suerte ${originLabel} · CodSuerte ${origin}` : "Centrar la suerte seleccionada");
+      fitLot.disabled = origin ? !geoFeatureForLot(origin) : !selected;
+    }
+    const primaryNav = $("casurGeoPrimaryNav");
+    if (primaryNav) {
+      const label = geoSelectedDetailLabel(geoActiveContext, selected);
+      primaryNav.textContent = label;
+      primaryNav.setAttribute("aria-label", label);
+    }
+    if (pngFarm) pngFarm.disabled = !geoFeatures.length || geoExportBusy;
+    if (pngLot) pngLot.disabled = !selected || geoExportBusy;
+  }
+
+  function openGeoSelectedDetail() {
+    if (!geoActiveContext || !geoMapController) return false;
+    const selected = geoLotId(geoMapController.getSelectedLotId?.() || geoActiveContext.selectedLotId);
+    const mode = geoSelectedDetailMode(geoActiveContext, selected);
+    if (!mode) return false;
+    const source = geoActiveContext.source;
+    const farmCode = geoActiveContext.farmCode;
+    const record = geoRecordForLot(geoActiveContext, selected);
+    closeCasurGeoDialog();
+    requestAnimationFrame(() => {
+      if (mode === "historico" && source === "historico") {
+        if (typeof window.renderEntity === "function") {
+          window.renderEntity(`LOTE::${selected}`, { preserveDrilldown: true, fromDrilldown: true });
+        }
+        return;
+      }
+      if (mode === "cronologico" && record && typeof window.selectCronoSuerteSuggestion === "function") {
+        window.selectCronoSuerteSuggestion(farmCode, record.suerte);
+      }
+    });
+    return true;
+  }
+
+  function ensureGeoDialog() {
+    if ($("casurGeoLayer")) return $("casurGeoLayer");
+    document.body.insertAdjacentHTML("beforeend", `
+      <div class="casur-geo-layer no-print export-excluded" id="casurGeoLayer" hidden>
+        <button class="casur-geo-backdrop" type="button" tabindex="-1" data-geo-close aria-label="Cerrar mapa"></button>
+        <section class="casur-geo-dialog" role="dialog" aria-modal="true" aria-labelledby="casurGeoTitle" aria-describedby="casurGeoStatus">
+          <header class="casur-geo-head">
+            <div><span class="casur-geo-eyebrow">Referencia geográfica CASUR</span><h2 id="casurGeoTitle" tabindex="-1">Mapa agrícola</h2><p id="casurGeoSummary"></p></div>
+            <button class="casur-geo-close" type="button" data-geo-close aria-label="Cerrar mapa">Cerrar</button>
+          </header>
+          <div class="casur-geo-body" id="casurGeoBody" aria-busy="false">
+            <div class="casur-geo-loading" id="casurGeoLoading" role="status">Preparando referencia geográfica…</div>
+            <div class="casur-geo-empty" id="casurGeoEmpty" hidden></div>
+            <div class="casur-geo-map" id="casurGeoMap" hidden aria-label="Mapa de polígonos agrícolas CASUR"></div>
+            <aside class="casur-geo-card" id="casurGeoCard" aria-live="polite"></aside>
+          </div>
+          <footer class="casur-geo-foot">
+            <p id="casurGeoStatus" role="status" aria-live="polite"></p>
+            <div class="casur-geo-foot-actions"><button type="button" class="casur-geo-control" id="casurGeoFitFarm" disabled>Finca completa</button><button type="button" class="casur-geo-control" id="casurGeoFitLot" disabled>Centrar seleccionada</button><button type="button" class="casur-geo-control" id="casurGeoPngFarm" disabled>PNG finca</button><button type="button" class="casur-geo-control" id="casurGeoPngLot" disabled>PNG suerte</button><button type="button" class="casur-geo-control is-primary" id="casurGeoPrimaryNav">Volver a la ficha</button></div>
+          </footer>
+        </section>
+      </div>`);
+    const layer = $("casurGeoLayer");
+    layer.querySelectorAll("[data-geo-close]").forEach((button) => button.addEventListener("click", closeCasurGeoDialog));
+    $("casurGeoPrimaryNav").addEventListener("click", () => {
+      if (!openGeoSelectedDetail()) closeCasurGeoDialog();
+    });
+    $("casurGeoFitFarm").addEventListener("click", () => {
+      try { geoMapController?.fitToData?.(); } catch (error) {}
+    });
+    $("casurGeoFitLot").addEventListener("click", () => {
+      try {
+        const selected = geoMapController?.getSelectedLotId?.();
+        const origin = geoLotId(geoActiveContext?.originLotId);
+        if (origin) {
+          if (geoMapController?.selectLot?.(origin, { fit: true })) {
+            geoActiveContext.selectedLotId = origin;
+            renderGeoInformationCard(origin);
+            syncGeoControls();
+          }
+        } else if (selected) geoMapController.fitToLot?.(selected);
+      } catch (error) {}
+    });
+    $("casurGeoPngFarm").addEventListener("click", (event) => runGeoExport("farm", event.currentTarget));
+    $("casurGeoPngLot").addEventListener("click", (event) => runGeoExport("lot", event.currentTarget));
+    layer.addEventListener("click", (event) => {
+      const collapseToggle = event.target.closest?.("[data-geo-card-toggle]");
+      if (collapseToggle) {
+        syncGeoCardCollapse($("casurGeoCard"), !geoCardCollapsed);
+        return;
+      }
+      const copy = event.target.closest?.("[data-geo-copy]");
+      if (copy) {
+        geoCopyCoordinates(copy.dataset.geoCopy).then(() => moduleToast("Coordenadas copiadas")).catch(() => moduleToast("No fue posible copiar las coordenadas"));
+        return;
+      }
+      const center = event.target.closest?.("[data-geo-center-selected]");
+      if (center) {
+        geoMapController?.fitToLot?.(geoLotId(center.dataset.geoCenterSelected));
+        return;
+      }
+      if (event.target.closest?.("[data-geo-open-selected]")) openGeoSelectedDetail();
+    });
+    layer.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") { event.preventDefault(); closeCasurGeoDialog(); return; }
+      if (event.key !== "Tab") return;
+      const focusable = [...layer.querySelectorAll("button:not([disabled]),[href],input,select,textarea,[tabindex]:not([tabindex='-1'])")]
+        .filter((node) => !node.hidden && node.offsetParent !== null);
+      if (!focusable.length) return;
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (!focusable.includes(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+      else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+    return layer;
+  }
+
+  function destroyGeoMap() {
+    const controller = geoMapController;
+    geoMapController = null;
+    if (controller && typeof controller.destroy === "function") {
+      try { controller.destroy(); } catch (error) {}
+    }
+    const map = $("casurGeoMap");
+    if (map) map.replaceChildren();
+    geoFeatures = [];
+    geoActiveContext = null;
+  }
+
+  function closeCasurGeoDialog() {
+    const layer = $("casurGeoLayer");
+    if (!layer || layer.hidden) return;
+    geoRequest += 1;
+    destroyGeoMap();
+    layer.hidden = true;
+    document.body.classList.remove("casur-geo-open");
+    const target = geoReturnFocus;
+    geoReturnFocus = null;
+    if (target && target.isConnected && typeof target.focus === "function") target.focus({ preventScroll: true });
+  }
+
+  function resetGeoDialog(context, total) {
+    const isLot = context?.entityType === "lote";
+    const lotId = context?.selectedLotId || "";
+    const source = context?.source === "historico" ? "histórico" : "cronológico";
+    const historicalLot = isLot && context?.source === "historico";
+    $("casurGeoTitle").textContent = historicalLot
+      ? `Mapa histórico · ${context.name || `Finca ${context?.farmCode || ""}`}`
+      : (isLot && context?.source === "cronologico"
+        ? `Mapa cronológico · ${context.name || (context.farmCode ? "Finca " + context.farmCode : "Sin nombre")} · Suerte ${geoSuerteLabel(context, lotId)}`
+        : (isLot ? `Mapa ${source} · Suerte ${lotId}` : `Mapa ${source} · Finca ${context?.farmCode || ""}`));
+    $("casurGeoSummary").textContent = historicalLot
+      ? geoHistoricalLotSubject(context, lotId)
+      : (isLot && context?.source === "cronologico"
+        ? "Análisis cronológico y referencia geográfica de la suerte seleccionada."
+        : (isLot ? `Contexto completo de ${context.name}; selección de origen resaltada.` : `Preparando ${total} suertes del contexto espacial.`));
+    $("casurGeoStatus").textContent = "Cargando geometría publicada…";
+    $("casurGeoLoading").hidden = false;
+    $("casurGeoEmpty").hidden = true;
+    $("casurGeoEmpty").textContent = "";
+    $("casurGeoMap").hidden = true;
+    $("casurGeoFitFarm").disabled = true;
+    $("casurGeoFitLot").disabled = true;
+    $("casurGeoPngFarm").disabled = true;
+    $("casurGeoPngLot").disabled = true;
+    $("casurGeoBody").setAttribute("aria-busy", "true");
+    geoCardCollapsed = Boolean(window.matchMedia?.("(max-width: 719px)")?.matches);
+    renderGeoInformationCard(lotId);
+    $("casurGeoCard").hidden = true;
+  }
+
+  function showGeoEmpty(message, status = message) {
+    $("casurGeoLoading").hidden = true;
+    $("casurGeoMap").hidden = true;
+    $("casurGeoEmpty").hidden = false;
+    $("casurGeoEmpty").textContent = message;
+    $("casurGeoStatus").textContent = status;
+    $("casurGeoBody").setAttribute("aria-busy", "false");
+    $("casurGeoCard").hidden = true;
+  }
+
+  async function openCasurGeoDialog(value, trigger) {
+    const context = geoContext(value);
+    if (!context) return;
+    const request = ++geoRequest;
+    const layer = ensureGeoDialog();
+    destroyGeoMap();
+    geoActiveContext = {
+      ...context,
+      selectedLotId: geoLotId(context.selectedLotId),
+      originLotId: geoLotId(context.originLotId || context.selectedLotId),
+    };
+    geoReturnFocus = trigger || document.activeElement;
+    const lotIds = geoActiveContext.lotIds;
+    resetGeoDialog(geoActiveContext, lotIds.length);
+    layer.hidden = false;
+    document.body.classList.add("casur-geo-open");
+    requestAnimationFrame(() => $("casurGeoTitle")?.focus({ preventScroll: true }));
+
+    try {
+      const geo = window.CASUR_GEO_DATA;
+      const createMap = window.createCasurMap;
+      if (!geo || typeof geo.getLotGeometry !== "function" || typeof geo.getLotGeometries !== "function" || typeof createMap !== "function") {
+        throw new Error("Motor geográfico no disponible");
+      }
+      if (!lotIds.length) {
+        showGeoEmpty("No hay suertes identificadas para esta finca en el Maestro de Suertes.");
+        return;
+      }
+
+      const features = await geo.getLotGeometries(lotIds);
+      if (request !== geoRequest || layer.hidden) return;
+      if (!features.length) {
+        showGeoEmpty("Ninguna suerte de esta finca tiene polígono en la referencia geográfica actual.", `0 de ${lotIds.length} suertes con polígono`);
+        return;
+      }
+
+      geoFeatures = features;
+      const mapNode = $("casurGeoMap");
+      mapNode.hidden = false;
+      $("casurGeoLoading").hidden = true;
+      geoMapController = await Promise.resolve(createMap(mapNode, {
+        initialBase: "hybrid",
+        layersCollapsed: true,
+        autoFit: false,
+        ...(geoActiveContext.source === "cronologico" ? { lotTooltipLabel: (_feature, lotId) => geoChronologicalLotTooltipLabel(geoActiveContext, lotId) } : {}),
+        onSelectLot(feature) {
+          const selected = geoLotId(feature?.properties?.lotId);
+          geoActiveContext.selectedLotId = selected;
+          renderGeoInformationCard(selected);
+          syncGeoControls();
+        },
+      }));
+      if (!geoMapController || request !== geoRequest || layer.hidden) {
+        destroyGeoMap();
+        return;
+      }
+      await Promise.resolve(geoMapController.setLots(features, geoActiveContext.selectedLotId));
+      await Promise.resolve(geoMapController.fitToData());
+      geoActiveContext.selectedLotId = geoMapController.getSelectedLotId?.() || "";
+      renderGeoInformationCard(geoActiveContext.selectedLotId);
+      $("casurGeoCard").hidden = false;
+      const featureIds = new Set(features.map((feature) => geoLotId(feature?.properties?.lotId)));
+      const availableCurrent = geoActiveContext.currentIds.filter((lotId) => featureIds.has(lotId)).length;
+      const spatialSummary = geoActiveContext.source === "historico"
+        ? `${features.length} de ${lotIds.length} geometrías del contexto`
+        : (geoActiveContext.currentIds.length
+          ? `${availableCurrent} de ${geoActiveContext.currentIds.length} suertes actuales con polígono`
+          : `${features.length} de ${lotIds.length} suertes históricas con polígono`);
+      const historicalModel = geoActiveContext.source === "historico" ? geoHistoricalCardModel(geoActiveContext) : null;
+      const historicalSuffix = historicalModel?.hasData ? ` · ${geoCount(historicalModel.historicalKpis.seasonCount)} zafras históricas` : "";
+      const selectedHasGeometry = !geoActiveContext.originLotId || featureIds.has(geoActiveContext.originLotId);
+      const missing = Math.max(0, (geoActiveContext.currentIds.length || lotIds.length) - (geoActiveContext.currentIds.length ? availableCurrent : features.length));
+      const historicalLotSubject = geoActiveContext.source === "historico" && geoActiveContext.entityType === "lote"
+        ? geoHistoricalLotSubject(geoActiveContext, geoActiveContext.originLotId)
+        : "";
+      $("casurGeoSummary").textContent = geoActiveContext.source === "cronologico" && geoActiveContext.entityType === "lote"
+        ? `Análisis cronológico y referencia geográfica · ${spatialSummary}`
+        : [historicalLotSubject, `${spatialSummary}${historicalSuffix}`].filter(Boolean).join(" · ");
+      $("casurGeoStatus").textContent = selectedHasGeometry
+        ? (missing ? `${missing} ${missing === 1 ? "suerte sin polígono" : "suertes sin polígono"}` : "Cobertura espacial completa")
+        : `La suerte ${geoSuerteLabel(geoActiveContext, geoActiveContext.originLotId)} · CodSuerte ${geoActiveContext.originLotId} no tiene polígono disponible`;
+      syncGeoControls();
+      $("casurGeoBody").setAttribute("aria-busy", "false");
+    } catch (error) {
+      if (request !== geoRequest || layer.hidden) return;
+      console.warn("[CASUR GEO] No se pudo abrir el mapa:", error);
+      showGeoEmpty("No fue posible cargar la referencia geográfica. Intente nuevamente.", "Mapa temporalmente no disponible");
+    }
+  }
+
+  function addGeoAction(content, context) {
+    const actions = content?.querySelector(".ficha-actions");
+    const group = actions?.querySelector(".casur-visual-actions");
+    if (!group || group.querySelector("[data-casur-geo-action]") || !context) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "casur-visual-action map no-print";
+    button.dataset.casurGeoAction = context.entityType;
+    button.innerHTML = `<span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M3 6.5 8.5 3l7 3 5.5-3.5v15L15.5 21l-7-3L3 21zM8.5 3v15m7-12v15" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="copy"><b>Mapa</b><small>${context.entityType === "lote" ? "Suerte y finca" : "Finca completa"}</small></span>`;
+    button.setAttribute("aria-label", context.entityType === "lote"
+      ? `Abrir mapa de la suerte ${geoSuerteLabel(context, context.selectedLotId)} · CodSuerte ${context.selectedLotId} con su finca completa`
+      : `Abrir mapa de la finca ${context.name || context.farmCode}`);
+    button.addEventListener("click", () => openCasurGeoDialog(context, button));
+    group.appendChild(button);
+  }
+
+  function enhanceHistoricalGeoView() {
+    const entity = activeHistoricalEntity();
+    if (entity) addGeoAction($("fichaContent"), geoHistoricalContext(entity));
+  }
+
+  function enhanceCronoGeoView() {
+    addGeoAction($("cronoContent"), geoCronoContext());
+  }
+
+  function installGeoObservers() {
+    const history = $("fichaContent");
+    const crono = $("cronoContent");
+    if (history && !geoFichaObserver) {
+      geoFichaObserver = new MutationObserver(() => queueMicrotask(enhanceHistoricalGeoView));
+      geoFichaObserver.observe(history, { childList: true, subtree: true });
+    }
+    if (crono && !geoCronoObserver) {
+      geoCronoObserver = new MutationObserver(() => queueMicrotask(enhanceCronoGeoView));
+      geoCronoObserver.observe(crono, { childList: true, subtree: true });
+    }
+    enhanceHistoricalGeoView();
+    enhanceCronoGeoView();
+  }
+
+  window.CASUR_PRODUCTION_GEO = Object.freeze({
+    lotIdsForEntity: geoLotIdsForEntity,
+    currentLotIds: geoCurrentLotIds,
+    historicalContext: geoHistoricalContext,
+    cronoContext: geoCronoContext,
+    historicalCardModel: geoHistoricalCardModel,
+    selectedDetailLabel: geoSelectedDetailLabel,
+    chronologicalCardMarkup: geoChronologicalCardMarkup,
+    historicalCardMarkup: geoHistoricalCardMarkup,
+    exportFilename: geoExportFilename,
+    exportPng: exportCasurGeoPng,
+    enhance: enhanceHistoricalGeoView,
+    open: openCasurGeoDialog,
+    close: closeCasurGeoDialog,
+  });
+
+  /* [Fase 4.4.3] Sincronización automática real de datos publicados.
+     Desde el Hotfix 4.4.3 el propio Service Worker raíz resuelve una
+     GENERACIÓN COMPLETA y coherente de los 6 archivos (ver sw.js:
+     produccionDataGate/resolveGeneration) y nunca sirve una versión anterior
+     a la última buena conocida. Por eso esta función ya NO vuelve a validar
+     cronológico/histórico por su cuenta (evita duplicar esa lógica): solo
+     detecta si el SW resolvió algo distinto a lo cargado en esta página y,
+     si es así, recarga UNA sola vez este iframe para tomarlo — con guard
+     real contra recargas repetidas y verificación de que lo cargado tras
+     recargar coincide con lo esperado (nunca un toast de éxito falso). */
+  async function checkForDataUpdate(force = false) {
+    return window.CASUR_OFFICIAL_DATA_UPDATES?.check(force);
+  }
+
+  function initAdmin() {
+    const section = $("masterUpdateSection");
+    if (!section) return;
+    const unlocked = unlockValid();
+    section.classList.toggle("is-locked", !unlocked);
+    updateAdminLauncher(unlocked, unlocked && section.open);
+    section.addEventListener("toggle", () => {
+      if (section.open && !unlockValid()) { section.open = false; section.classList.add("is-locked"); updateAdminLauncher(false, false); requestAdminUnlock(); }
+      else if (section.open) { touchUnlock(); updateAdminLauncher(true, true); }
+      else updateAdminLauncher(unlockValid(), false);
+    });
+    refreshCronoEditorOptions(); refreshHistoryOptions();
+    document.querySelectorAll(".casur-admin-tab").forEach((button) => button.addEventListener("click", () => switchEditor(button.dataset.editor)));
+  }
+
+  window.goMasterModule = openAdmin;
+  window.casurLoadCronoEditor = loadCronoEditor;
+  window.casurNewCronoEditor = newCronoEditor;
+  window.casurSaveCronoEditor = saveCronoEditor;
+  window.casurDeleteCronoEditor = deleteCronoEditor;
+  window.casurLoadHistoryLot = loadHistoryLot;
+  window.casurLoadHistorySeason = loadHistorySeason;
+  window.casurSaveHistorySeason = saveHistorySeason;
+  window.casurApplyImportedExcel = applyImportedExcel;
+  window.casurDownloadDataUpdate = downloadDataUpdate;
+  window.casurCheckForDataUpdate = () => checkForDataUpdate(true);
+  /* [INTEGRACIÓN App Maestra] API para que el shell genere el paquete de datos
+     directamente, sin que el usuario navegue manualmente al Centro Maestro de
+     Producción. Reutiliza downloadDataUpdate() sin duplicar su lógica. */
+  window.CASUR_GENERATE_GITHUB_DATA_PACKAGE = downloadDataUpdate;
+  window.CASUR_BUILD_CRONO_DATA = buildCronoData;
+  window.CASUR_REFRESH_OPERATIONAL_VIEW = refreshOperationalView;
+  window.CASUR_CRONO_PARTICIPATION = Object.freeze({summary: estimateSummary, coverageText: estimateCoverageText,
+    forecastForRow, referenceDate, dateSummary, dateKpi, formatDate: formatCronoDate, cutTypeText, estimateCaption, detailColumns,
+    currentAgeSummary, currentAgeKpi, cropStage, agronomicGroups, orderAgronomicGroups, areaPanel, estimatedTchPanel, estimatedTonsKpi});
+
+  function openModuleContext(context) {
+    if (!context || context.kind !== "lot") return { ok: false, status: "invalid-context" };
+    const lotId = text(context.lotId);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(lotId)) return { ok: false, status: "invalid-context" };
+    const code = `LOTE::${lotId}`;
+    if (typeof window.lotByCode !== "function" || !window.lotByCode(code)) {
+      return { ok: false, status: "lot-not-found" };
+    }
+    if (typeof window.renderEntity !== "function") return { ok: false, status: "unavailable" };
+    window.renderEntity(code);
+    return { ok: true, status: "opened" };
+  }
+
+  window.CASUR_MODULE_BRIDGE = Object.freeze({
+    protocolVersion: 1,
+    moduleId: "produccion",
+    async checkpoint() { return window.CRONO_DATA?.meta?.manualChanges ? {ok:false,status:'manual-view-not-persisted'} : { ok: true, status: "noop" }; },
+    openContext: openModuleContext,
+  });
+
+  window.addEventListener("load", () => {
+    releaseStrip(); installCronoObserver(); installGeoObservers(); initAdmin(); ensureLockDialog(); ensureGeoDialog();
+  });
+})();
